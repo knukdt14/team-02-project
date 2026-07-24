@@ -1,0 +1,48 @@
+# =====================================================================
+# 산업안전보건 법령 RAG 프로젝트 - 필요한 패키지
+# 설치: pip install -r requirements.txt
+#
+# 버전을 고정하지 않아 pip가 서로 호환되는 조합을 자동으로 찾는다.
+# (langchain 계열은 버전이 강하게 얽혀 있어 고정하면 충돌나기 쉬움)
+# =====================================================================
+
+# ----- LangChain 코어 -----
+langchain
+langchain-community
+langchain-text-splitters
+
+# ----- 데이터 수집/로드 (fetch_law.py, load_data.py) -----
+requests            # 국가법령정보센터 Open API 호출
+pypdf               # PDF 로드(PyPDFLoader)
+python-dotenv       # .env 에서 API 키 로드
+
+# ----- 임베딩 & 로컬 LLM (build_vectorstore.py, rag_chain.py) -----
+langchain-huggingface
+sentence-transformers   # ko-sbert 등 한국어 임베딩
+transformers            # Qwen / Llama 로컬 모델
+torch
+accelerate              # device_map="auto" 로 GPU 자동 배치
+
+# ----- 벡터DB -----
+faiss-cpu
+langchain-chroma
+chromadb
+
+# ----- API LLM -----
+langchain-openai        # OpenAI(ChatGPT) + RAGAS 심판 기본값
+openai
+langchain-upstage       # Upstage(Solar)
+langchain-anthropic     # Claude
+
+# ----- 평가 (evaluate.py) -----
+bert-score
+ragas
+datasets
+pandas
+
+# ----- (선택) 그래프DB: store_type="neo4j" 쓸 때만 -----
+langchain-neo4j
+neo4j
+
+# ----- (선택) 하이브리드 검색용 BM25 -----
+rank-bm25
