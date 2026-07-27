@@ -119,7 +119,12 @@ class HFChatLLM:
           기본 False → 기존 모델(Qwen/Llama 등)은 동작 변화 없음.
           내장 구조 모델은 True여도 옵션이 무시되므로 무해함.
           ※ 신뢰 가능한 공식 저장소의 모델에만 사용할 것.
+
+        model_name 이 LoRA 어댑터 폴더(adapter_config.json 포함)면
+        베이스 모델 위에 어댑터를 얹어 로드한다(파인튜닝 모델 평가용).
+        일반 모델명/경로면 기존과 동일하게 동작한다.
         """
+        from pathlib import Path
         from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
         import torch
 
@@ -144,6 +149,30 @@ class HFChatLLM:
                 bnb_4bit_use_double_quant=True,
             )
 
+<<<<<<< HEAD
+        # LoRA 어댑터 폴더인지 자동 감지 (파인튜닝 결과물)
+        is_adapter = Path(model_name, "adapter_config.json").exists()
+
+        if is_adapter:
+            from peft import AutoPeftModelForCausalLM
+            print(f"  [HFChatLLM] LoRA 어댑터 감지 → 베이스 모델 위에 로드: {model_name}")
+            model = AutoPeftModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                quantization_config=quant_cfg,
+                trust_remote_code=trust_remote_code,
+            )
+            model.eval()
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                quantization_config=quant_cfg,
+                trust_remote_code=trust_remote_code,
+            )
+=======
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=dtype,
@@ -151,6 +180,7 @@ class HFChatLLM:
             quantization_config=quant_cfg,
             trust_remote_code=trust_remote_code,
         )
+>>>>>>> dd04f5c5b6ae32b6726866f67637ccc9c34e3dda
         self.pipe = pipeline(
             "text-generation", model=model, tokenizer=self.tokenizer,
             max_new_tokens=max_new_tokens,
