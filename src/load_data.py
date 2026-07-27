@@ -79,6 +79,8 @@ def load_json(path: Path, splitter: RecursiveCharacterTextSplitter | None) -> li
             "법령종류": it.get("법령종류", ""),
             "장": it.get("장", ""),
             "조문번호": it.get("조문번호", ""),
+            "조문가지번호": it.get("조문가지번호", ""),   # 제619조'의2'
+            "조문표시": it.get("조문표시", ""),           # '제619조의2' 전체 표기
             "조문제목": it.get("조문제목", ""),
             "시행일자": it.get("시행일자", ""),
         }

@@ -20,7 +20,7 @@ python-dotenv       # .env 에서 API 키 로드
 langchain-huggingface
 sentence-transformers   # ko-sbert 등 한국어 임베딩
 transformers            # Qwen / Llama 로컬 모델
-torch
+# torch                 # 버전 안 맞으요
 accelerate              # device_map="auto" 로 GPU 자동 배치
 
 # ----- 벡터DB -----
