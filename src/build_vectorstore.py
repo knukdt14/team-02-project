@@ -247,6 +247,14 @@ if __name__ == "__main__":
     parser.add_argument("--store_type", default="faiss", choices=list(STORE_BUILDERS.keys()))
     parser.add_argument("--embedding_name", default="hf", choices=["hf", "openai"])
     parser.add_argument(
+        "--embedding_model",
+        default=None,
+        help=(
+            "구체 임베딩 모델명. 예: BAAI/bge-m3. "
+            "생략하면 선택한 제공자의 기본 모델을 사용"
+        ),
+    )
+    parser.add_argument(
         "--embedding_device",
         default="cpu",
         choices=["cpu", "cuda"],
@@ -262,6 +270,7 @@ if __name__ == "__main__":
         docs,
         store_type=args.store_type,
         embedding_name=args.embedding_name,
+        embedding_model=args.embedding_model,
         embedding_device=args.embedding_device,
         persist_dir=args.persist_dir,
     )

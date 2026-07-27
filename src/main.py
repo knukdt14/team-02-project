@@ -50,8 +50,11 @@ def make_run_name(args) -> str:
     if args.run_name:
         return args.run_name
     model = args.model_name or args.llm_type
+    # 같은 HF 통합 이름을 사용해도 실제 임베딩 모델은 다를 수 있습니다.
+    # 자동 결과 파일명에 구체 모델명을 넣어 실험 결과가 덮어써지지 않게 합니다.
+    embedding_label = args.embedding_model or args.embedding_name
     return (f"{_safe(model)}_{args.prompt_name}_k{args.top_k}"
-            f"_{args.search_type}_{args.store_type}_{args.embedding_name}")
+            f"_{args.search_type}_{args.store_type}_{_safe(embedding_label)}")
 
 
 # =====================================================================
@@ -66,6 +69,9 @@ CONFIG = dict(
     # 저장소 / 임베딩
     store_type="faiss",
     embedding_name="hf",
+    # 빈 문자열이면 기존 기본값(jhgan/ko-sbert-nli)을 사용합니다.
+    # 비교 실험에서는 --embedding_model BAAI/bge-m3처럼 직접 지정합니다.
+    embedding_model="",
     embedding_device="cpu",    # 8GB GPU 메모리는 7B LLM에 양보하고 임베딩은 CPU 사용
     store_dir=str(PROJECT_ROOT / "stores"),  # 저장된 벡터DB를 다음 실행에서 재사용
     rebuild_store=False,       # True면 저장된 것 무시하고 새로 생성
@@ -119,12 +125,23 @@ def parse_args():
 def get_or_build_store(args):
     """
     벡터DB 저장/재사용:
-      같은 (데이터, chunk, overlap, store_type, embedding) 조합이면
+      같은 (데이터, chunk, overlap, store_type, embedding model) 조합이면
       저장된 스토어를 로드해 재임베딩을 건너뛴다. (--rebuild_store 로 강제 재생성)
+
+    중요:
+      임베딩 모델이 다르면 벡터 차원과 값이 달라지므로 기존 FAISS를 재사용하면
+      안 됩니다. 구체 모델명을 저장 경로 키에 넣어 모델별 DB를 분리합니다.
     """
+    # 기존 기본 모델은 예전 stores/..._hf 경로를 그대로 사용해 호환성을 유지합니다.
+    # BGE-M3처럼 구체 모델을 지정한 실험만 별도 경로를 만듭니다.
+    embedding_key = args.embedding_name
+    if args.embedding_model:
+        embedding_key = f"{embedding_key}_{_safe(args.embedding_model)}"
+
     key = (f"{_safe(Path(args.data_path).stem)}_c{args.chunk_size}"
-           f"_o{args.overlap_size}_{args.store_type}_{args.embedding_name}")
+           f"_o{args.overlap_size}_{args.store_type}_{embedding_key}")
     persist_dir = str(Path(args.store_dir) / key)
+    embedding_model = args.embedding_model or None
 
     can_persist = args.store_type in ("faiss", "chroma")  # neo4j는 DB 자체 저장
     exists = Path(persist_dir).exists() and any(Path(persist_dir).iterdir()) \
@@ -134,6 +151,7 @@ def get_or_build_store(args):
         print(f"[store] 저장된 벡터DB 재사용: {persist_dir} (재임베딩 생략)")
         return load_vectorstore(store_type=args.store_type,
                                 embedding_name=args.embedding_name,
+                                embedding_model=embedding_model,
                                 persist_dir=persist_dir,
                                 embedding_device=args.embedding_device)
 
@@ -142,6 +160,7 @@ def get_or_build_store(args):
                      chunk_size=args.chunk_size, overlap_size=args.overlap_size)
     store = build_vectorstore(docs, store_type=args.store_type,
                               embedding_name=args.embedding_name,
+                              embedding_model=embedding_model,
                               persist_dir=persist_dir if can_persist else None,
                               embedding_device=args.embedding_device)
     if can_persist:
@@ -201,6 +220,10 @@ def main():
         "search": args.search_type,
         "store": args.store_type,
         "embed": args.embedding_name,
+        # CSV에 구체 임베딩 모델을 남겨 hf 실험끼리도 구분할 수 있게 합니다.
+        "embedding_model": (
+            args.embedding_model or "jhgan/ko-sbert-nli"
+        ),
         "chunk": args.chunk_size,
         "single_max_tokens": args.max_new_tokens,
         "multi_max_tokens": args.multi_max_new_tokens,

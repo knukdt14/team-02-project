@@ -1,0 +1,21 @@
+BGE-M3 embedding comparison patch
+=================================
+
+1. Copy this ZIP's files over the project root while preserving folders.
+2. Open a terminal in the project root.
+3. Run:
+
+   conda activate SAFETY_RAG_PY311
+   evaluate_embedding_bge_m3_ksj.bat
+   compare_embedding_ksj.bat
+
+Expected result CSV:
+
+   eval\results\mistral7b_base_hybrid_v3_bge_m3_ksj.csv
+
+The first run downloads BAAI/bge-m3 and creates a separate FAISS store:
+
+   stores\laws_all_c500_o50_faiss_hf_bge-m3
+
+No model, existing vector store, law JSON, or evaluation CSV is included in
+this patch ZIP.
