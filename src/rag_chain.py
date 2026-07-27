@@ -112,11 +112,19 @@ class HFChatLLM:
     """
 
     def __init__(self, model_name: str, temperature: float = 0.2,
-                 max_new_tokens: int = 512, load_in_4bit: bool = False):
+                 max_new_tokens: int = 512, load_in_4bit: bool = False,
+                 trust_remote_code: bool = False):
+        """
+        trust_remote_code: EXAONE 등 저장소에 모델 정의 코드가 포함된 모델용.
+          기본 False → 기존 모델(Qwen/Llama 등)은 동작 변화 없음.
+          내장 구조 모델은 True여도 옵션이 무시되므로 무해함.
+          ※ 신뢰 가능한 공식 저장소의 모델에만 사용할 것.
+        """
         from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
         import torch
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=trust_remote_code)
 
         # 4비트 양자화: VRAM 부족(예: 8GB GPU에 7B 모델) 시 사용
         quant_cfg = None
@@ -134,6 +142,7 @@ class HFChatLLM:
             torch_dtype=torch.float16,
             device_map="auto",
             quantization_config=quant_cfg,
+            trust_remote_code=trust_remote_code,
         )
         self.pipe = pipeline(
             "text-generation", model=model, tokenizer=self.tokenizer,
@@ -189,7 +198,7 @@ class APIChatLLM:
 def get_llm(llm_type: str = "hf", model_name: str | None = None,
             temperature: float = 0.2, max_new_tokens: int = 512,
             api_key: str | None = None, base_url: str | None = None,
-            load_in_4bit: bool = False):
+            load_in_4bit: bool = False, trust_remote_code: bool = False):
     """
     반환: .chat(system, user) -> str 을 지원하는 래퍼 객체.
 
@@ -209,12 +218,12 @@ def get_llm(llm_type: str = "hf", model_name: str | None = None,
             kw["base_url"] = base_url
         return kw
 
-    # --- HuggingFace 로컬 모델 (Qwen / Llama / 파인튜닝 모델) ---
+    # --- HuggingFace 로컬 모델 (Qwen / Llama / EXAONE / 파인튜닝 모델) ---
     if t == "hf":
         return HFChatLLM(
             model_name or "Qwen/Qwen2.5-7B-Instruct",
             temperature=temperature, max_new_tokens=max_new_tokens,
-            load_in_4bit=load_in_4bit,
+            load_in_4bit=load_in_4bit, trust_remote_code=trust_remote_code,
         )
 
     # --- Upstage (Solar) ---
@@ -387,6 +396,7 @@ def build_rag_chain(
     api_key: str | None = None,
     base_url: str | None = None,
     load_in_4bit: bool = False,
+    trust_remote_code: bool = False,
     score_threshold: float = 0.0,
 ) -> RagChain:
     """
@@ -404,7 +414,8 @@ def build_rag_chain(
     """
     llm = get_llm(llm_type, model_name, temperature=temperature,
                   max_new_tokens=max_new_tokens,
-                  api_key=api_key, base_url=base_url, load_in_4bit=load_in_4bit)
+                  api_key=api_key, base_url=base_url, load_in_4bit=load_in_4bit,
+                  trust_remote_code=trust_remote_code)
     prompt = get_prompt(prompt_name)
     chain = RagChain(store, llm, prompt, top_k=top_k, search_type=search_type,
                      score_threshold=score_threshold)
