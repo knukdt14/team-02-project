@@ -219,3 +219,33 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# =====================================================================
+# team-02 프로젝트 추가 규칙
+# =====================================================================
+
+# --- 파인튜닝 산출물 (용량이 매우 큼. 절대 커밋 금지) ---
+models/
+outputs/
+checkpoints/
+adapters/
+*.safetensors
+*.bin
+*.pt
+*.gguf
+
+# --- 학습 로그 / 실험 추적 도구 ---
+wandb/
+runs/
+logs/
+
+# --- 실행 결과 (루트의 results/ 만 무시. eval/results/ 는 계속 커밋함) ---
+/results/
+
+# --- 에디터 개인 설정 ---
+.vscode/
+.idea/
+
+# --- HuggingFace 캐시 (실수로 프로젝트 안에 받았을 때) ---
+.cache/
+huggingface/
