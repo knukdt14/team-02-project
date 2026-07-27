@@ -67,17 +67,18 @@ CONFIG = dict(
     score_threshold=0.0,       # 0.0=끔. 예: 0.25 → 최고 관련도가 그 미만이면 LLM 호출 없이 거부
     # LLM
     llm_type="hf",
-    model_name="Qwen/Qwen2.5-1.5B-Instruct",
+    model_name="Qwen/Qwen2.5-7B-Instruct",
     load_in_4bit=False,   # VRAM 부족(8GB GPU 등)이면 --load_in_4bit 로 켜기
+    trust_remote_code=False,  # EXAONE 등 커스텀 코드 모델이면 --trust_remote_code 로 켜기
     # 검색 / 프롬프트
     prompt_name="basic",
     top_k=3,
     search_type="similarity",
     # 평가
     questions_csv="../eval/questions.csv",
-    results_dir="../eval/results",   # 결과 CSV들을 모아둘 폴더
-    run_name="test_v1",                # 결과 파일 이름(확장자 제외). 비우면 설정값으로 자동 생성
-    use_ragas=True,
+    results_dir="../results",   # 결과 CSV들을 모아둘 폴더
+    run_name="",                # 결과 파일 이름(확장자 제외). 비우면 설정값으로 자동 생성
+    use_ragas=False,
     ragas_judge="upstage",      # RAGAS 심판: "upstage"(UPSTAGE_API_KEY) 또는 "openai"
 )
 
@@ -141,6 +142,7 @@ def main():
         llm_type=args.llm_type, model_name=args.model_name,
         prompt_name=args.prompt_name, top_k=args.top_k,
         search_type=args.search_type, load_in_4bit=args.load_in_4bit,
+        trust_remote_code=args.trust_remote_code,
         score_threshold=args.score_threshold,
     )
 
