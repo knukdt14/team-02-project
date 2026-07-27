@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# 테스트용 py
+main_copy.py
+
 # Distribution / packaging
 .Python
 build/
