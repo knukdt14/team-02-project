@@ -22,6 +22,8 @@ sentence-transformers   # ko-sbert 등 한국어 임베딩
 transformers            # Qwen / Llama 로컬 모델
 # torch                 # 버전 안 맞으요
 accelerate              # device_map="auto" 로 GPU 자동 배치
+# bitsandbytes          # 4bit 양자화(--load_in_4bit) 쓸 때만 설치.
+#                       # NVIDIA GPU + 윈도우/리눅스 전용 (맥은 설치 실패할 수 있음)
 
 # ----- 벡터DB -----
 faiss-cpu

@@ -40,13 +40,25 @@ def _safe(s) -> str:
     return re.sub(r"[^0-9A-Za-z가-힣._-]", "_", s)
 
 
+def embed_tag(args) -> str:
+    """
+    임베딩 식별 꼬리표.
+    --embedding_model 을 직접 지정했을 때만 모델명을 덧붙인다.
+    지정하지 않으면 기존과 똑같은 값("hf")이 나오므로,
+    이미 만들어 둔 벡터DB와 결과 파일 이름이 그대로 유지된다.
+    """
+    if getattr(args, "embedding_model", ""):
+        return f"{args.embedding_name}-{_safe(args.embedding_model)}"
+    return args.embedding_name
+
+
 def make_run_name(args) -> str:
     """run_name이 비어 있으면 설정값으로 자동 파일명 생성."""
     if args.run_name:
         return args.run_name
     model = args.model_name or args.llm_type
     return (f"{_safe(model)}_{args.prompt_name}_k{args.top_k}"
-            f"_{args.search_type}_{args.store_type}_{args.embedding_name}")
+            f"_{args.search_type}_{args.store_type}_{embed_tag(args)}")
 
 
 # =====================================================================
@@ -61,6 +73,8 @@ CONFIG = dict(
     # 저장소 / 임베딩
     store_type="faiss",
     embedding_name="hf",
+    embedding_model="",        # 임베딩 모델명 직접 지정(선택). 예: BAAI/bge-m3
+                               # 비우면 기존 기본 모델(jhgan/ko-sbert-nli) 사용
     store_dir="../stores",     # 벡터DB 저장 폴더 (재사용으로 재임베딩 방지)
     rebuild_store=False,       # True면 저장된 것 무시하고 새로 생성
     # 검색 게이트
@@ -70,6 +84,7 @@ CONFIG = dict(
     model_name="Qwen/Qwen2.5-7B-Instruct",
     load_in_4bit=False,   # VRAM 부족(8GB GPU 등)이면 --load_in_4bit 로 켜기
     trust_remote_code=False,  # EXAONE 등 커스텀 코드 모델이면 --trust_remote_code 로 켜기
+    temperature=0.2,          # 0.0이면 greedy(항상 같은 답) → 실험 재현성 확보
     # 검색 / 프롬프트
     prompt_name="basic",
     top_k=3,
@@ -102,11 +117,11 @@ def parse_args():
 def get_or_build_store(args):
     """
     벡터DB 저장/재사용:
-      같은 (데이터, chunk, overlap, store_type, embedding) 조합이면
+      같은 (데이터, chunk, overlap, store_type, 임베딩 모델) 조합이면
       저장된 스토어를 로드해 재임베딩을 건너뛴다. (--rebuild_store 로 강제 재생성)
     """
     key = (f"{_safe(Path(args.data_path).stem)}_c{args.chunk_size}"
-           f"_o{args.overlap_size}_{args.store_type}_{args.embedding_name}")
+           f"_o{args.overlap_size}_{args.store_type}_{embed_tag(args)}")
     persist_dir = str(Path(args.store_dir) / key)
 
     can_persist = args.store_type in ("faiss", "chroma")  # neo4j는 DB 자체 저장
@@ -117,6 +132,7 @@ def get_or_build_store(args):
         print(f"[store] 저장된 벡터DB 재사용: {persist_dir} (재임베딩 생략)")
         return load_vectorstore(store_type=args.store_type,
                                 embedding_name=args.embedding_name,
+                                embedding_model=args.embedding_model or None,
                                 persist_dir=persist_dir)
 
     # 1) 데이터 로드 + 청킹 → 2) 임베딩 + 저장
@@ -124,6 +140,7 @@ def get_or_build_store(args):
                      chunk_size=args.chunk_size, overlap_size=args.overlap_size)
     store = build_vectorstore(docs, store_type=args.store_type,
                               embedding_name=args.embedding_name,
+                              embedding_model=args.embedding_model or None,
                               persist_dir=persist_dir if can_persist else None)
     if can_persist:
         print(f"[store] 벡터DB 저장 완료: {persist_dir} (다음 실행부터 재사용)")
@@ -143,6 +160,7 @@ def main():
         prompt_name=args.prompt_name, top_k=args.top_k,
         search_type=args.search_type, load_in_4bit=args.load_in_4bit,
         trust_remote_code=args.trust_remote_code,
+        temperature=args.temperature,
         score_threshold=args.score_threshold,
     )
 
@@ -169,7 +187,9 @@ def main():
         "search": args.search_type,
         "store": args.store_type,
         "embed": args.embedding_name,
+        "embed_model": args.embedding_model,
         "chunk": args.chunk_size,
+        "temp": args.temperature,
     }
     evaluate(
         chain,
