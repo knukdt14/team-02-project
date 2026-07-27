@@ -104,6 +104,46 @@ def get_prompt(prompt_name: str = "basic") -> dict:
 # =====================================================================
 # 2) LLM 래퍼 — 어떤 모델이든 .chat(system, user) -> str 로 통일
 # =====================================================================
+def _patch_input_embeddings(model) -> str | None:
+    """
+    일부 커스텀 모델(EXAONE 등)은 get_input_embeddings() 를 구현하지 않아
+    PEFT 어댑터 로드가 실패한다. 임베딩 층을 찾아 클래스에 주입한다.
+    ※ LoRA 어댑터 로드 경로에서만 호출되므로 기존 모델 동작에는 영향이 없다.
+    """
+    import torch.nn as nn
+
+    owners = [model]
+    for a in ("transformer", "model", "base_model"):
+        sub = getattr(model, a, None)
+        if sub is not None:
+            owners.append(sub)
+
+    for owner in owners:
+        for attr in ("wte", "embed_tokens", "word_embeddings", "tok_embeddings"):
+            emb = getattr(owner, attr, None)
+            if isinstance(emb, nn.Embedding):
+                cls = type(owner)
+                cls._input_embed_layer = attr
+                cls.get_input_embeddings = lambda self, _a=attr: getattr(self, _a)
+                cls.set_input_embeddings = lambda self, v, _a=attr: setattr(self, _a, v)
+                if owner is not model:
+                    type(model).get_input_embeddings = lambda self, _e=emb: _e
+                    type(model).set_input_embeddings = lambda self, v: None
+                return f"{cls.__name__}.{attr}"
+
+    # 폴백: 가장 큰 Embedding 을 토큰 임베딩으로 간주
+    best_name, best = None, None
+    for name, sub in model.named_modules():
+        if isinstance(sub, nn.Embedding):
+            if best is None or sub.num_embeddings > best.num_embeddings:
+                best_name, best = name, sub
+    if best is not None:
+        type(model).get_input_embeddings = lambda self, _e=best: _e
+        type(model).set_input_embeddings = lambda self, v: None
+        return f"(fallback) {best_name}"
+    return None
+
+
 class HFChatLLM:
     """
     HuggingFace 로컬 모델 래퍼.
@@ -153,15 +193,27 @@ class HFChatLLM:
         is_adapter = Path(model_name, "adapter_config.json").exists()
 
         if is_adapter:
-            from peft import AutoPeftModelForCausalLM
-            print(f"  [HFChatLLM] LoRA 어댑터 감지 → 베이스 모델 위에 로드: {model_name}")
-            model = AutoPeftModelForCausalLM.from_pretrained(
-                model_name,
+            import json
+            from peft import PeftModel
+
+            # 어댑터 설정에서 베이스 모델명을 읽어 베이스를 먼저 로드한다.
+            # (AutoPeftModelForCausalLM 은 내부에서 get_input_embeddings 를 호출해
+            #  EXAONE 등 일부 커스텀 모델에서 실패하므로 단계를 분리)
+            with open(Path(model_name, "adapter_config.json"), encoding="utf-8") as f:
+                base_name = json.load(f).get("base_model_name_or_path")
+            print(f"  [HFChatLLM] LoRA 어댑터 감지 → 베이스({base_name}) 위에 로드")
+
+            model = AutoModelForCausalLM.from_pretrained(
+                base_name,
                 torch_dtype=dtype,
                 device_map="auto",
                 quantization_config=quant_cfg,
                 trust_remote_code=trust_remote_code,
             )
+            patched = _patch_input_embeddings(model)
+            if patched:
+                print(f"  [HFChatLLM] 입력 임베딩 연결: {patched}")
+            model = PeftModel.from_pretrained(model, model_name)
             model.eval()
         else:
             model = AutoModelForCausalLM.from_pretrained(
