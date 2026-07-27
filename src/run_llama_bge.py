@@ -63,13 +63,16 @@ FLAGS = ["load_in_4bit"]               # 8GB VRAM 대응
 # 2) 실험 목록
 # =====================================================================
 EXPERIMENTS = [
-    # 실험 2-2에서 가장 좋았던 설정
-    {"prompt_name": "strict", "top_k": 5},
-    {"prompt_name": "cite", "top_k": 5},
+    # ----- 완료 (2026-07-27) : 다시 돌릴 필요 없어 주석 처리 -----
+    # {"prompt_name": "strict", "top_k": 5},   # F1 0.7392 / kw 0.4340 / cite_acc 0.3542
+    # {"prompt_name": "cite",   "top_k": 5},   # F1 0.7214 / kw 0.4536 / cite_acc 0.4931
+    # {"prompt_name": "strict", "top_k": 3},   # F1 0.7528 / kw 0.4880 / cite_acc 0.4167
 
-    # 대조군: 실험 1과 top_k 를 맞춤
-    # → 이것과 실험1(strict/k3/ko-sbert)의 차이가 '순수 임베딩 효과'
-    {"prompt_name": "strict", "top_k": 3},
+    # ----- 남은 조합 -----
+    # top_k=3 이 top_k=5 보다 답변 품질이 좋았고(노이즈가 덜 섞임),
+    # cite 프롬프트가 인용 정확도에서 가장 높았다.
+    # 둘을 합친 조합이 최적일 가능성이 높아 확인한다.
+    {"prompt_name": "cite", "top_k": 3},
 ]
 
 
