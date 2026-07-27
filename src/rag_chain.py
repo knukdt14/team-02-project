@@ -131,9 +131,9 @@ class HFChatLLM:
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=trust_remote_code)
 
-        # 연산 dtype 자동 선택:
-        #   최신 GPU(Ampere 이상)는 bfloat16을 지원 → Llama-3 계열이 bf16으로
-        #   학습돼 있어 수치가 더 안정적이다. 미지원 GPU(T4 등)는 기존 fp16 그대로.
+        # 연산 dtype 자동 감지
+        #   bf16 지원 GPU(Ampere 이상)면 bf16, 아니면 fp16 폴백.
+        #   양자화 연산과 모델 로딩의 dtype을 통일해야 dtype 충돌이 없다.
         dtype = (torch.bfloat16
                  if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
                  else torch.float16)
@@ -149,7 +149,6 @@ class HFChatLLM:
                 bnb_4bit_use_double_quant=True,
             )
 
-<<<<<<< HEAD
         # LoRA 어댑터 폴더인지 자동 감지 (파인튜닝 결과물)
         is_adapter = Path(model_name, "adapter_config.json").exists()
 
@@ -158,7 +157,7 @@ class HFChatLLM:
             print(f"  [HFChatLLM] LoRA 어댑터 감지 → 베이스 모델 위에 로드: {model_name}")
             model = AutoPeftModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch.float16,
+                torch_dtype=dtype,
                 device_map="auto",
                 quantization_config=quant_cfg,
                 trust_remote_code=trust_remote_code,
@@ -167,20 +166,11 @@ class HFChatLLM:
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch.float16,
+                torch_dtype=dtype,
                 device_map="auto",
                 quantization_config=quant_cfg,
                 trust_remote_code=trust_remote_code,
             )
-=======
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            device_map="auto",
-            quantization_config=quant_cfg,
-            trust_remote_code=trust_remote_code,
-        )
->>>>>>> dd04f5c5b6ae32b6726866f67637ccc9c34e3dda
         self.pipe = pipeline(
             "text-generation", model=model, tokenizer=self.tokenizer,
             max_new_tokens=max_new_tokens,
