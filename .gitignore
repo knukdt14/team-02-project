@@ -244,7 +244,7 @@ logs/
 
 # --- 실행 결과 (루트의 results/ 만 무시. eval/results/ 는 계속 커밋함) ---
 /results/
-
+results/
 # --- 에디터 개인 설정 ---
 .vscode/
 .idea/
@@ -252,3 +252,6 @@ logs/
 # --- HuggingFace 캐시 (실수로 프로젝트 안에 받았을 때) ---
 .cache/
 huggingface/
+
+# --- finetune (인환) ---
+finetune/
