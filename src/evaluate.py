@@ -14,7 +14,8 @@ RAG 파이프라인 4단계: 평가.
      - recall_at_k     : 필요한 정답 조문 중 몇 %를 찾았는지
      - precision_at_k  : 검색 결과 중 정답 조문 비율
      - mrr             : 첫 정답 조문이 몇 번째로 검색됐는지 (1/순위)
-  6) citation_acc     : 답변에 표기된 출처 조문이 정답 근거와 일치하는 비율
+  6) citation_precision/recall:
+     답변이 실제 사용했다고 표기한 출처(used_sources)가 정답 근거와 맞는지 평가
   7) refusal_acc      : 답변불가형(unanswerable) 질문을 제대로 거절했는지 (0/1)
 
 입력
@@ -82,7 +83,34 @@ def _law_short(name: str) -> str:
     return ""
 
 
-_ART_RE = re.compile(r"제\s*(\d+)\s*조(?:의\s*(\d+))?|별표\s*(\d*)")
+_ART_RE = re.compile(r"제\s*(\d+)\s*조(?:의\s*(\d+))?|별표\s*(\d*(?:의\s*\d+)?)")
+
+
+def _normalize_article(key: str) -> str:
+    """
+    조문/별표 키를 비교 가능한 형태로 정규화합니다.
+
+    법령 JSON에는 별표3이 '별표0003의00'처럼 저장되는 경우가 있습니다.
+    이를 그대로 비교하면 실제 같은 별표를 틀렸다고 채점하므로,
+    앞자리 0과 의미 없는 '의00'을 제거합니다.
+    """
+    compact = str(key).replace(" ", "")
+    if compact.startswith("별표"):
+        m = re.fullmatch(r"별표(\d*)(?:의(\d+))?", compact)
+        if not m or not m.group(1):
+            return "별표"
+        main = str(int(m.group(1)))
+        sub = m.group(2)
+        if sub and int(sub) != 0:
+            return f"별표{main}의{int(sub)}"
+        return f"별표{main}"
+
+    m = re.fullmatch(r"0*(\d+)(?:의0*(\d+))?", compact)
+    if m:
+        main = str(int(m.group(1)))
+        sub = m.group(2)
+        return f"{main}의{int(sub)}" if sub is not None else main
+    return compact
 
 
 def parse_gold_articles(ref_law: str, ref_article: str) -> list[tuple[str, str]]:
@@ -93,11 +121,25 @@ def parse_gold_articles(ref_law: str, ref_article: str) -> list[tuple[str, str]]
     '규칙 제37조 + 법 제38조·제167조' 같은 복합 표기도 처리:
     조문 앞에 나온 가장 가까운 법령 단서(법/시행령/규칙)를 따라간다.
     """
+    # '제38·39조'처럼 두 번째 숫자에 '제/조'가 생략된 표기를 먼저 확장합니다.
+    # 두 번 이상 연결된 경우를 위해 변화가 없을 때까지 반복합니다.
+    expanded = ref_article
+    while True:
+        new = re.sub(
+            r"제\s*(\d+(?:\s*의\s*\d+)?)\s*[·ㆍ]\s*"
+            r"(\d+(?:\s*의\s*\d+)?)\s*조",
+            r"제\1조·제\2조",
+            expanded,
+        )
+        if new == expanded:
+            break
+        expanded = new
+
     default_law = _law_short(ref_law)
     gold = []
     current_law = default_law
     # 텍스트를 순회하며 법령 단서를 갱신하고, 조문 패턴을 수집
-    tokens = re.split(r"(\s+|\+|·|,|/)", ref_article)
+    tokens = re.split(r"(\s+|\+|·|ㆍ|,|/)", expanded)
     for tok in tokens:
         ls = _law_short(tok) if tok.strip() else ""
         if ls:
@@ -105,10 +147,10 @@ def parse_gold_articles(ref_law: str, ref_article: str) -> list[tuple[str, str]]
         for m in _ART_RE.finditer(tok):
             if m.group(1):  # 제N조(의M)
                 key = m.group(1) + (f"의{m.group(2)}" if m.group(2) else "")
-                gold.append((current_law, key))
+                gold.append((current_law, _normalize_article(key)))
             elif m.group(0).startswith("별표"):
                 key = "별표" + (m.group(3) or "")
-                gold.append(("", key.replace(" ", "")))
+                gold.append((current_law, _normalize_article(key)))
     # 중복 제거(순서 유지)
     seen, out = set(), []
     for g in gold:
@@ -128,23 +170,23 @@ def _parse_source(source: str) -> tuple[str, str]:
     m = re.search(r"제\s*(\d+)\s*조(?:의\s*(\d+))?\s*$", s)
     if m:
         key = m.group(1) + (f"의{m.group(2)}" if m.group(2) else "")
-        return (_law_short(s[:m.start()]), key)
+        return (_law_short(s[:m.start()]), _normalize_article(key))
     m = re.search(r"(별표\s*\d*(?:의\d+)?)\s*$", s)
     if m:
-        return (_law_short(s[:m.start()]), m.group(1).replace(" ", ""))
+        return (_law_short(s[:m.start()]), _normalize_article(m.group(1)))
     # 구형: 끝이 숫자('37', '619의2')
     m = re.match(r"^(.*?)\s*(\d+(?:의\d+)?)$", s)
     if m:
-        return (_law_short(m.group(1)), m.group(2))
+        return (_law_short(m.group(1)), _normalize_article(m.group(2)))
     return (_law_short(s), "")
 
 
 def _match(gold: tuple[str, str], src: tuple[str, str]) -> bool:
-    """정답 조문과 검색 조문의 일치 판정. 별표는 번호 없이도 느슨하게 매칭."""
+    """정답 조문과 검색 조문을 법령명과 정확한 조문/별표 번호로 비교합니다."""
     g_law, g_art = gold
     s_law, s_art = src
-    if g_art.startswith("별표") and s_art.startswith("별표"):
-        return True
+    g_art = _normalize_article(g_art)
+    s_art = _normalize_article(s_art)
     if g_art != s_art:
         return False
     return g_law == "" or s_law == "" or g_law == s_law
@@ -179,30 +221,80 @@ def retrieval_metrics(sources: list[str], gold: list[tuple[str, str]]) -> dict:
     }
 
 
-def citation_accuracy(answer: str, gold: list[tuple[str, str]]) -> float | None:
-    """답변에 표기된 조문 중 정답 근거와 일치하는 비율. gold 없으면 None."""
+def citation_metrics(
+    used_sources: list[str],
+    gold: list[tuple[str, str]],
+) -> dict:
+    """
+    실제 사용 출처(used_sources)를 정답 조문과 비교합니다.
+
+    sources는 검색 상위 k개 전체라서 답변이 실제 사용하지 않은 문서도 포함합니다.
+    따라서 인용 정확도는 반드시 모델이 [C1] 등으로 선택한 used_sources로 계산합니다.
+    """
     if not gold:
-        return None
+        return {
+            "citation_acc": None,
+            "citation_precision": None,
+            "citation_recall": None,
+            "citation_f1": None,
+        }
+
     cited = []
-    for m in _ART_RE.finditer(answer):
-        if m.group(1):
-            cited.append(m.group(1) + (f"의{m.group(2)}" if m.group(2) else ""))
+    for source in used_sources:
+        parsed = _parse_source(source)
+        if parsed not in cited:
+            cited.append(parsed)
+
     if not cited:
-        return 0.0  # 출처를 아예 표기하지 않음
-    gold_arts = {g[1] for g in gold}
-    ok = sum(1 for c in set(cited) if c in gold_arts)
-    return round(ok / len(set(cited)), 3)
+        return {
+            "citation_acc": 0.0,
+            "citation_precision": 0.0,
+            "citation_recall": 0.0,
+            "citation_f1": 0.0,
+        }
+
+    matched_cited = {
+        src for src in cited if any(_match(g, src) for g in gold)
+    }
+    matched_gold = {
+        g for g in gold if any(_match(g, src) for src in cited)
+    }
+    precision = len(matched_cited) / len(cited)
+    recall = len(matched_gold) / len(gold)
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall
+        else 0.0
+    )
+    return {
+        # 과거 결과 파일과의 호환성을 위해 citation_acc는 precision과 같은 값입니다.
+        "citation_acc": round(precision, 3),
+        "citation_precision": round(precision, 3),
+        "citation_recall": round(recall, 3),
+        "citation_f1": round(f1, 3),
+    }
 
 
 _REFUSAL_PATTERNS = ["찾을 수 없습니다", "답변드릴 수 없", "답변하기 어렵",
                      "제공하기 어렵", "확인할 수 없", "확인이 어렵", "알 수 없습니다"]
 
 
-def refusal_accuracy(answer: str, qtype: str) -> float | None:
+def refusal_accuracy(answer: str, qtype: str, status: str = "") -> float | None:
     """답변불가형(unanswerable) 질문에서 거절했으면 1, 아니면 0. 그 외 유형은 None."""
     if qtype != "unanswerable":
         return None
-    return 1.0 if any(p in answer for p in _REFUSAL_PATTERNS) else 0.0
+    refused = status == "REFUSE" or any(p in answer for p in _REFUSAL_PATTERNS)
+    return 1.0 if refused else 0.0
+
+
+def answerability_accuracy(answer: str, qtype: str, status: str = "") -> float:
+    """
+    답변 가능 질문은 답하고, 답변 불가 질문은 거절했는지 모두 평가합니다.
+    기존 refusal_acc는 unanswerable 2문항만 봐서 과도한 거절을 발견하지 못했습니다.
+    """
+    refused = status == "REFUSE" or any(p in answer for p in _REFUSAL_PATTERNS)
+    should_refuse = qtype == "unanswerable"
+    return 1.0 if refused == should_refuse else 0.0
 
 
 def load_references(path) -> dict:
@@ -309,7 +401,7 @@ def evaluate(
     references_csv: str | None = None,   # 미지정 시 questions.csv 옆의 references.csv
     use_bertscore: bool = True,
     use_keyword: bool = True,
-    use_ragas: bool = True,
+    use_ragas: bool = False,
     ragas_judge: str = "upstage",   # "upstage" | "openai"
     save: bool = True,
 ):
@@ -347,10 +439,21 @@ def evaluate(
             "question": q,
             "ground_truth": gt,
             "answer": res["answer"],
+            # 후처리 전 모델 출력도 저장해 모델 오류와 프로그램 오류를 구분합니다.
+            "raw_answer": res.get("raw_answer", res["answer"]),
             "latency": res["latency"],
             "contexts": res["contexts"],
             "sources": "; ".join(res["sources"]),
+            # 모델이 처음 고른 인용과 프로그램 검증 후 인용을 따로 저장합니다.
+            "model_used_sources": "; ".join(
+                res.get("model_used_sources", [])
+            ),
             "used_sources": "; ".join(res.get("used_sources", [])),
+            "citation_repaired": res.get("citation_repaired", False),
+            "status": res.get("status", ""),
+            "citation_status": res.get("citation_status", ""),
+            "question_mode": res.get("question_mode", ""),
+            "max_new_tokens_used": res.get("max_new_tokens_used", ""),
             "top_score": res.get("top_score", ""),
         }
         if use_keyword:
@@ -361,8 +464,23 @@ def evaluate(
         # --- 검색 지표 (references.csv 기반) ---
         gold = references.get(qid, [])
         rec.update(retrieval_metrics(res["sources"], gold))
-        rec["citation_acc"] = citation_accuracy(res["answer"], gold)
-        rec["refusal_acc"] = refusal_accuracy(res["answer"], qtype)
+        rec.update(citation_metrics(res.get("used_sources", []), gold))
+        # 자동 교정 전 모델 자체 인용 점수도 남겨 후처리로 점수를 숨기지 않습니다.
+        model_citation = citation_metrics(
+            res.get("model_used_sources", []),
+            gold,
+        )
+        for key, value in model_citation.items():
+            rec[f"model_{key}"] = value
+        rec["citation_repair_rate"] = (
+            1.0 if res.get("citation_repaired", False) else 0.0
+        )
+        rec["refusal_acc"] = refusal_accuracy(
+            res["answer"], qtype, res.get("status", "")
+        )
+        rec["answerability_acc"] = answerability_accuracy(
+            res["answer"], qtype, res.get("status", "")
+        )
 
         records.append(rec)
 
@@ -406,7 +524,11 @@ def evaluate(
 _METRIC_COLS = ["bertscore_p", "bertscore_r", "bertscore_f1",
                 "keyword_rate", "latency",
                 "hit_at_k", "recall_at_k", "precision_at_k", "mrr",
-                "citation_acc", "refusal_acc",
+                "citation_acc", "citation_precision", "citation_recall",
+                "citation_f1", "refusal_acc", "answerability_acc",
+                "model_citation_acc", "model_citation_precision",
+                "model_citation_recall", "model_citation_f1",
+                "citation_repair_rate",
                 "faithfulness", "answer_relevancy",
                 "context_precision", "context_recall"]
 
@@ -416,7 +538,10 @@ def _save_results(records, out_csv, exp_config):
     out.parent.mkdir(parents=True, exist_ok=True)
 
     base_cols = ["id", "유형", "난이도", "question", "ground_truth",
-                 "answer", "keywords", "sources", "used_sources", "top_score"]
+                 "answer", "raw_answer", "keywords", "sources",
+                 "model_used_sources", "used_sources", "citation_repaired",
+                 "contexts", "status", "citation_status", "question_mode",
+                 "max_new_tokens_used", "top_score"]
     exp_cols = list(exp_config.keys())
     cols = exp_cols + base_cols + _METRIC_COLS
 

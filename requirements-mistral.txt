@@ -1,0 +1,19 @@
+# Mistral 7B 로컬 추론/QLoRA용 추가 패키지
+# 먼저 CUDA용 PyTorch가 설치된 SAFETY_RAG_PY311 환경에서 실행하세요.
+# 설치 명령: python -m pip install -r requirements-mistral.txt
+
+-r requirements.txt
+
+# Mistral-7B-Instruct-v0.3은 Transformers 4.42 이상을 권장합니다.
+transformers>=4.42.0
+
+# 8GB GPU에서 7B 모델을 NF4 4비트로 실행하기 위한 패키지입니다.
+bitsandbytes>=0.48.0
+
+# QLoRA 어댑터 학습 및 학습된 어댑터 로드에 사용합니다.
+peft>=0.17.0
+
+# Mistral 토크나이저와 모델 파일 로드를 안정적으로 지원합니다.
+sentencepiece
+protobuf
+safetensors

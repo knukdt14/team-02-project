@@ -36,13 +36,18 @@ except ImportError:
 # =====================================================================
 # 1) 임베딩 모델 선택
 # =====================================================================
-def get_embeddings(embedding_name: str = "hf", model: str | None = None):
+def get_embeddings(
+    embedding_name: str = "hf",
+    model: str | None = None,
+    device: str = "cpu",
+):
     """
     embedding_name:
       - "hf"      : HuggingFace (기본 모델: jhgan/ko-sbert-nli, 한국어)
       - "openai"  : OpenAI (기본: text-embedding-3-small, OPENAI_API_KEY)
       - "upstage" : Upstage Solar 임베딩 (UPSTAGE_API_KEY)
     model: 특정 모델명을 직접 지정하고 싶을 때
+    device: HF 임베딩 계산 장치. 8GB GPU에서 7B LLM을 실행할 때는 "cpu" 권장
     """
     name = embedding_name.lower()
 
@@ -53,6 +58,7 @@ def get_embeddings(embedding_name: str = "hf", model: str | None = None):
             from langchain_community.embeddings import HuggingFaceEmbeddings  # 구버전
         return HuggingFaceEmbeddings(
             model_name=model or "jhgan/ko-sbert-nli",
+            model_kwargs={"device": device},
             encode_kwargs={"normalize_embeddings": True},
         )
 
@@ -168,6 +174,7 @@ def build_vectorstore(
     store_type: str = "faiss",
     embedding_name: str = "hf",
     embedding_model: str | None = None,
+    embedding_device: str = "cpu",
     persist_dir: str | None = "./stores/faiss",
     **store_kwargs,
 ):
@@ -179,6 +186,7 @@ def build_vectorstore(
         store_type     : "faiss" / "chroma" / "neo4j"  (실험 변수)
         embedding_name : "hf" / "openai"               (실험 변수)
         embedding_model: 특정 임베딩 모델명 (선택)
+        embedding_device: HF 임베딩 장치. 7B LLM과 함께 쓸 때 "cpu" 권장
         persist_dir    : 벡터DB 저장 경로 (neo4j는 무시, DB에 저장)
         store_kwargs   : neo4j 연결정보(url/username/password) 등
     Returns:
@@ -191,7 +199,11 @@ def build_vectorstore(
             f"사용 가능: {list(STORE_BUILDERS.keys())}"
         )
 
-    embeddings = get_embeddings(embedding_name, embedding_model)
+    embeddings = get_embeddings(
+        embedding_name,
+        embedding_model,
+        device=embedding_device,
+    )
     builder, kind = STORE_BUILDERS[st]
     store = builder(docs, embeddings, persist_dir, **store_kwargs)
 
@@ -204,6 +216,7 @@ def load_vectorstore(
     store_type: str = "faiss",
     embedding_name: str = "hf",
     embedding_model: str | None = None,
+    embedding_device: str = "cpu",
     persist_dir: str | None = "./stores/faiss",
     **store_kwargs,
 ):
@@ -211,7 +224,11 @@ def load_vectorstore(
     st = store_type.lower()
     if st not in STORE_LOADERS:
         raise ValueError(f"지원하지 않는 store_type: '{store_type}'")
-    embeddings = get_embeddings(embedding_name, embedding_model)
+    embeddings = get_embeddings(
+        embedding_name,
+        embedding_model,
+        device=embedding_device,
+    )
     store = STORE_LOADERS[st](embeddings, persist_dir, **store_kwargs)
     print(f"[load_vectorstore] '{st}' 로드 완료")
     return store
@@ -229,6 +246,12 @@ if __name__ == "__main__":
     parser.add_argument("--file_type", required=True, choices=["json", "pdf"])
     parser.add_argument("--store_type", default="faiss", choices=list(STORE_BUILDERS.keys()))
     parser.add_argument("--embedding_name", default="hf", choices=["hf", "openai"])
+    parser.add_argument(
+        "--embedding_device",
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help="HF 임베딩 계산 장치. 8GB GPU에서 Mistral 7B와 같이 쓸 때는 cpu 권장",
+    )
     parser.add_argument("--chunk_size", type=int, default=500)
     parser.add_argument("--overlap_size", type=int, default=50)
     parser.add_argument("--persist_dir", default="./stores/test")
@@ -239,6 +262,7 @@ if __name__ == "__main__":
         docs,
         store_type=args.store_type,
         embedding_name=args.embedding_name,
+        embedding_device=args.embedding_device,
         persist_dir=args.persist_dir,
     )
 

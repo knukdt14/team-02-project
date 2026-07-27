@@ -34,6 +34,11 @@ from rag_chain import build_rag_chain
 from evaluate import evaluate
 
 
+# 이 파일을 어느 폴더에서 실행하더라도 같은 data/eval/stores 경로를 사용합니다.
+# 예: 프로젝트 루트와 src 폴더 중 어디에서 실행해도 경로가 달라지지 않습니다.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _safe(s) -> str:
     """파일명에 못 쓰는 문자를 _로 치환. 경로(모델명)는 마지막 요소만 사용."""
     s = str(s).replace("\\", "/").rstrip("/").split("/")[-1]
@@ -54,30 +59,37 @@ def make_run_name(args) -> str:
 # =====================================================================
 CONFIG = dict(
     # 데이터
-    data_path="../data/laws_all.json",
+    data_path=str(PROJECT_ROOT / "data" / "laws_all.json"),
     file_type="json",
     chunk_size=500,
     overlap_size=50,
     # 저장소 / 임베딩
     store_type="faiss",
     embedding_name="hf",
-    store_dir="../stores",     # 벡터DB 저장 폴더 (재사용으로 재임베딩 방지)
+    embedding_device="cpu",    # 8GB GPU 메모리는 7B LLM에 양보하고 임베딩은 CPU 사용
+    store_dir=str(PROJECT_ROOT / "stores"),  # 저장된 벡터DB를 다음 실행에서 재사용
     rebuild_store=False,       # True면 저장된 것 무시하고 새로 생성
     # 검색 게이트
-    score_threshold=0.0,       # 0.0=끔. 예: 0.25 → 최고 관련도가 그 미만이면 LLM 호출 없이 거부
+    score_threshold=0.0,       # 임계값은 검증셋으로 보정하기 전까지 0.0(끔)으로 유지
     # LLM
     llm_type="hf",
-    model_name="Qwen/Qwen2.5-1.5B-Instruct",
-    load_in_4bit=False,   # VRAM 부족(8GB GPU 등)이면 --load_in_4bit 로 켜기
+    model_name="mistralai/Mistral-7B-Instruct-v0.3",
+    load_in_4bit=True,         # 7B FP16은 8GB에 안 들어가므로 NF4 4비트가 필수
+    force_cuda=True,           # CPU로 조용히 폴백하지 않고 CUDA 미지원 시 즉시 오류
+    temperature=0.0,           # 법령 답변은 무작위성을 끄고 재현성을 확보
+    max_new_tokens=160,        # 장황한 답변과 긴 대기 시간을 줄임
+    multi_max_new_tokens=280,  # 복합질문만 항목 누락 방지를 위해 길이를 늘림
+    repetition_penalty=1.05,   # 같은 문장 반복을 약하게 억제
     # 검색 / 프롬프트
-    prompt_name="basic",
-    top_k=3,
-    search_type="similarity",
+    prompt_name="strict",
+    top_k=5,
+    # dense 임베딩 + 한국어 법률 용어 BM25를 합쳐 조문 누락을 줄입니다.
+    search_type="hybrid",
     # 평가
-    questions_csv="../eval/questions.csv",
-    results_dir="../eval/results",   # 결과 CSV들을 모아둘 폴더
-    run_name="test_v1",                # 결과 파일 이름(확장자 제외). 비우면 설정값으로 자동 생성
-    use_ragas=True,
+    questions_csv=str(PROJECT_ROOT / "eval" / "questions.csv"),
+    results_dir=str(PROJECT_ROOT / "eval" / "results"),
+    run_name="",                 # 비워 두면 모델·설정으로 중복 없는 이름을 자동 생성
+    use_ragas=False,             # API 키와 비용이 필요한 RAGAS는 명시적으로 켤 때만 실행
     ragas_judge="upstage",      # RAGAS 심판: "upstage"(UPSTAGE_API_KEY) 또는 "openai"
 )
 
@@ -86,7 +98,13 @@ def parse_args():
     p = argparse.ArgumentParser(description="RAG 파이프라인 실행")
     for k, v in CONFIG.items():
         if isinstance(v, bool):
-            p.add_argument(f"--{k}", action="store_true", default=v)
+            # True/False 기본값 모두 명령행에서 뒤집을 수 있게 합니다.
+            # 예: --load_in_4bit / --no-load_in_4bit, --use_ragas / --no-use_ragas
+            p.add_argument(
+                f"--{k}",
+                action=argparse.BooleanOptionalAction,
+                default=v,
+            )
         elif isinstance(v, int):
             p.add_argument(f"--{k}", type=int, default=v)
         elif isinstance(v, float):
@@ -116,14 +134,16 @@ def get_or_build_store(args):
         print(f"[store] 저장된 벡터DB 재사용: {persist_dir} (재임베딩 생략)")
         return load_vectorstore(store_type=args.store_type,
                                 embedding_name=args.embedding_name,
-                                persist_dir=persist_dir)
+                                persist_dir=persist_dir,
+                                embedding_device=args.embedding_device)
 
     # 1) 데이터 로드 + 청킹 → 2) 임베딩 + 저장
     docs = load_data(args.data_path, args.file_type,
                      chunk_size=args.chunk_size, overlap_size=args.overlap_size)
     store = build_vectorstore(docs, store_type=args.store_type,
                               embedding_name=args.embedding_name,
-                              persist_dir=persist_dir if can_persist else None)
+                              persist_dir=persist_dir if can_persist else None,
+                              embedding_device=args.embedding_device)
     if can_persist:
         print(f"[store] 벡터DB 저장 완료: {persist_dir} (다음 실행부터 재사용)")
     return store
@@ -142,6 +162,11 @@ def main():
         prompt_name=args.prompt_name, top_k=args.top_k,
         search_type=args.search_type, load_in_4bit=args.load_in_4bit,
         score_threshold=args.score_threshold,
+        temperature=args.temperature,
+        max_new_tokens=args.max_new_tokens,
+        multi_max_new_tokens=args.multi_max_new_tokens,
+        repetition_penalty=args.repetition_penalty,
+        force_cuda=args.force_cuda,
     )
 
     # 4-a) 질문 1개만 확인하고 끝
@@ -149,8 +174,17 @@ def main():
         r = chain.ask(args.ask)
         print("\n[질문]", r["question"])
         print("[답변]", r["answer"])
+        print("[모델 원문]", r.get("raw_answer", r["answer"]))
         print("[검색된 근거]", r["sources"])
-        print("[실제 사용 출처]", r.get("used_sources", []))
+        print("[모델 원문 인용]", r.get("model_used_sources", []))
+        print("[검증된 사용 출처]", r.get("used_sources", []))
+        print("[인용 자동 교정]", r.get("citation_repaired", False))
+        print("[인용 상태]", r.get("citation_status"))
+        print(
+            "[질문 유형/생성 한도]",
+            r.get("question_mode"),
+            r.get("max_new_tokens_used"),
+        )
         print("[최고 관련도]", r.get("top_score"), "| 검색통과:", r.get("retrieved"))
         print("[응답시간]", r["latency"], "초")
         return
@@ -168,6 +202,10 @@ def main():
         "store": args.store_type,
         "embed": args.embedding_name,
         "chunk": args.chunk_size,
+        "single_max_tokens": args.max_new_tokens,
+        "multi_max_tokens": args.multi_max_new_tokens,
+        "quantization": "nf4_4bit" if args.load_in_4bit else "none",
+        "device": "cuda" if args.force_cuda else "auto",
     }
     evaluate(
         chain,

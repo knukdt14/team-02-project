@@ -1,0 +1,9 @@
+# Windows CMD가 배치 파일을 안정적으로 읽도록 CRLF 줄바꿈을 강제합니다.
+*.bat text eol=crlf
+
+# Python/문서/데이터는 플랫폼과 관계없이 LF로 관리합니다.
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
