@@ -70,6 +70,7 @@ CONFIG = dict(
     model_name="Qwen/Qwen2.5-7B-Instruct",
     load_in_4bit=False,   # VRAM 부족(8GB GPU 등)이면 --load_in_4bit 로 켜기
     trust_remote_code=False,  # EXAONE 등 커스텀 코드 모델이면 --trust_remote_code 로 켜기
+    temperature=0.2,          # 0.0이면 greedy(항상 같은 답) → 실험 재현성 확보
     # 검색 / 프롬프트
     prompt_name="basic",
     top_k=3,
@@ -143,6 +144,7 @@ def main():
         prompt_name=args.prompt_name, top_k=args.top_k,
         search_type=args.search_type, load_in_4bit=args.load_in_4bit,
         trust_remote_code=args.trust_remote_code,
+        temperature=args.temperature,
         score_threshold=args.score_threshold,
     )
 
@@ -170,6 +172,7 @@ def main():
         "store": args.store_type,
         "embed": args.embedding_name,
         "chunk": args.chunk_size,
+        "temp": args.temperature,
     }
     evaluate(
         chain,
