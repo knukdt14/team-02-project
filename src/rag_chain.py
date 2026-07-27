@@ -126,6 +126,13 @@ class HFChatLLM:
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=trust_remote_code)
 
+        # 연산 dtype 자동 선택:
+        #   최신 GPU(Ampere 이상)는 bfloat16을 지원 → Llama-3 계열이 bf16으로
+        #   학습돼 있어 수치가 더 안정적이다. 미지원 GPU(T4 등)는 기존 fp16 그대로.
+        dtype = (torch.bfloat16
+                 if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+                 else torch.float16)
+
         # 4비트 양자화: VRAM 부족(예: 8GB GPU에 7B 모델) 시 사용
         quant_cfg = None
         if load_in_4bit:
@@ -133,13 +140,13 @@ class HFChatLLM:
             quant_cfg = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_compute_dtype=dtype,
                 bnb_4bit_use_double_quant=True,
             )
 
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
+            torch_dtype=dtype,
             device_map="auto",
             quantization_config=quant_cfg,
             trust_remote_code=trust_remote_code,
