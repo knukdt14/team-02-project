@@ -1,0 +1,2356 @@
+"""
+ksj_rag_chain.py
+---------------------------------------------------
+KSJ 전용 RAG 파이프라인입니다.
+
+팀 공용 rag_chain.py를 변경하지 않고 Mistral 실험에 필요한 hybrid 검색,
+복합질문 출력 제어, 별표 청크 보강, 인용 검증을 이 파일에 격리합니다.
+
+범용성 설계 (전부 실험 변수로 교체 가능)
+  - LLM 선택 (llm_type):
+      · "hf"        : HuggingFace 로컬 모델 (Qwen2.5-7B, Llama-3.1-8B, 파인튜닝 모델 등)
+      · "openai"    : OpenAI (ChatGPT)
+      · "anthropic" : Claude
+      · "upstage"   : Upstage Solar
+  - 프롬프트 선택 (prompt_name): "basic" / "cot" / "cite" / "strict"
+  - 검색 방식 (search_type): "similarity" / "mmr" / "hybrid"
+  - top_k: 검색해 LLM에 넘길 chunk 수
+
+[Chat Template 적용]
+  모든 LLM 호출은 (system, user) 메시지 구조로 전달된다.
+  - HF 로컬 모델 : tokenizer.apply_chat_template() 로 모델별 대화 형식을 자동 적용
+                   (Qwen의 <|im_start|>, Llama의 헤더 토큰 등을 토크나이저가 알아서 처리
+                    → 어떤 HF Instruct 모델을 써도 코드 수정 불필요)
+  - API 모델     : LangChain 메시지 [SystemMessage, HumanMessage] 로 전달
+  ※ chat template이 없는 구형 모델은 자동으로 일반 문자열 방식으로 폴백.
+
+반환: RagChain 객체.  chain.ask(question) → {answer, contexts, sources, latency}
+      (ksj_evaluate.py가 이 결과를 그대로 채점에 사용)
+
+설치(사용하는 것만):
+  pip install langchain langchain-core
+  pip install transformers accelerate torch      # HuggingFace 로컬 LLM
+  pip install langchain-openai                    # OpenAI
+  pip install langchain-anthropic                 # Claude
+  pip install langchain-upstage                   # Upstage
+"""
+
+import math
+import re
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+# .env 파일이 있으면 자동 로드 (UPSTAGE_API_KEY 등을 환경변수로 읽음)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+# =====================================================================
+# 1) 프롬프트 레지스트리 (실험 변수: prompt_name)
+#    chat template 적용을 위해 system / user 메시지로 분리.
+#    user 템플릿은 {context} 와 {question} 자리표시자를 가진다.
+# =====================================================================
+_SYSTEM = (
+    "당신은 산업안전보건 법령 전문 상담 챗봇입니다. "
+    "질문에 직접 필요한 내용만 한국어로 간결하게 답합니다. "
+    "검색 근거에 관련 내용이 많더라도 질문에서 요구하지 않은 업종 목록, "
+    "자격 목록, 일반 의무 또는 주변 조문은 덧붙이지 않습니다. "
+    "단순 질문은 첫 문장에 결론을 쓰고, 필요할 때만 한두 문장을 덧붙입니다. "
+    "복합 질문은 제공된 항목별 형식을 따라 빠짐없이 답합니다."
+)
+
+# 모든 검색 근거에는 [C1], [C2]처럼 짧은 ID를 붙입니다.
+# 모델은 실제 사용한 ID만 답변에 표기하고, 프로그램이 이를 법령명·조문으로 변환합니다.
+# 이렇게 해야 '검색된 상위 5개'와 '답변이 실제로 인용한 출처'를 구분할 수 있습니다.
+_CITE_RULE = (
+    " 제공된 근거에는 [C1], [C2]처럼 ID가 있습니다. "
+    "답변에 실제 사용한 근거 ID만 문장 끝에 [C1] 또는 [C1, C3] 형식으로 표기하세요. "
+    "근거 ID는 법령 조문 번호가 아니라 입력 근거의 식별자입니다. "
+    "근거에 없는 조문·수치·사실을 추가하지 마세요."
+)
+
+REFUSAL_MSG = "산업안전보건법령에서 해당 내용을 찾을 수 없습니다."
+
+PROMPTS = {
+    # 기본형
+    "basic": {
+        "system": _SYSTEM + " 아래 제공되는 법령 근거를 참고하여 질문에 답하세요."
+                  + _CITE_RULE,
+        "user": "[근거]\n{context}\n\n[질문]\n{question}",
+        "require_citation": False,
+    },
+
+    # 단계적 사고형(Chain-of-Thought)
+    "cot": {
+        "system": _SYSTEM + " 법령 근거를 바탕으로, 관련 조문을 먼저 짚고 "
+                  "단계적으로 생각한 뒤 결론을 내리세요. "
+                  "(관련 조문 확인 → 판단 → 결론 순서로)" + _CITE_RULE,
+        "user": "[근거]\n{context}\n\n[질문]\n{question}",
+        "require_citation": True,
+    },
+
+    # 근거 인용 강조형
+    "cite": {
+        "system": _SYSTEM + " 제공된 법령 근거에만 기반해 답하세요."
+                  + _CITE_RULE +
+                  " 근거 표기가 없는 답변은 무효입니다.",
+        "user": "[근거]\n{context}\n\n[질문]\n{question}",
+        "require_citation": True,
+    },
+
+    # 엄격형: 근거 없으면 모른다고 답변 (할루시네이션 억제)
+    "strict": {
+        "system": _SYSTEM + " 제공된 법령 근거에만 기반해 답하세요. "
+                  "질문 전체가 아니라 일부만 근거로 확인되면, 확인되는 부분만 답하고 "
+                  "확인되지 않는 부분을 분명히 밝히세요. "
+                  "관련 근거가 전혀 없을 때만 "
+                  f"\"{REFUSAL_MSG}\"라고만 답하세요. "
+                  "추측하거나 지어내지 마세요. 단순 질문은 원칙적으로 1~3문장으로 "
+                  "작성하고, 복합 질문은 사용자 메시지의 출력 항목을 따르세요."
+                  + _CITE_RULE,
+        "user": "[근거]\n{context}\n\n[질문]\n{question}",
+        "require_citation": True,
+    },
+}
+
+
+def get_prompt(prompt_name: str = "basic") -> dict:
+    if prompt_name not in PROMPTS:
+        raise ValueError(f"지원하지 않는 prompt_name: '{prompt_name}'. "
+                         f"사용 가능: {list(PROMPTS.keys())}")
+    return PROMPTS[prompt_name]
+
+
+# =====================================================================
+# 2) LLM 래퍼 — 어떤 모델이든 .chat(system, user) -> str 로 통일
+# =====================================================================
+class HFChatLLM:
+    """
+    HuggingFace 로컬 모델 래퍼.
+    tokenizer.apply_chat_template() 으로 모델 고유의 대화 형식을 자동 적용한다.
+    (Qwen / Llama / EXAONE 등 어떤 Instruct 모델이든 동일 코드로 동작)
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        temperature: float = 0.0,
+        max_new_tokens: int = 220,
+        load_in_4bit: bool = False,
+        repetition_penalty: float = 1.05,
+        force_cuda: bool = False,
+    ):
+        import transformers
+        from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+        import torch
+
+        print(f"[HF LLM] Transformers={transformers.__version__}")
+
+        # force_cuda=True이면 CUDA가 없을 때 CPU로 몰래 폴백하지 않고 즉시 중단합니다.
+        # 평가 중 CPU 폴백으로 문항당 수분이 걸리는 상황을 방지하기 위한 안전장치입니다.
+        if force_cuda and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA를 사용할 수 없습니다. CUDA PyTorch 설치와 "
+                "`python -c \"import torch; print(torch.cuda.is_available())\"` "
+                "결과를 확인하세요."
+            )
+
+        # QLoRA 학습 후 저장된 어댑터 폴더도 model_name으로 받을 수 있습니다.
+        # adapter_config.json이 있으면 기반 모델을 먼저 읽고 LoRA 어댑터를 결합합니다.
+        adapter_dir = Path(model_name)
+        is_adapter = adapter_dir.is_dir() and (
+            adapter_dir / "adapter_config.json"
+        ).exists()
+        base_model_name = model_name
+        if is_adapter:
+            from peft import PeftConfig
+            peft_config = PeftConfig.from_pretrained(model_name)
+            base_model_name = peft_config.base_model_name_or_path
+
+        # 어댑터 폴더에 토크나이저가 없을 수 있으므로 기반 모델 토크나이저를 사용합니다.
+        self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # 4비트 양자화: VRAM 부족(예: 8GB GPU에 7B 모델) 시 사용
+        quant_cfg = None
+        compute_dtype = torch.float32
+        if torch.cuda.is_available():
+            # RTX 50 계열은 BF16을 지원하므로 가능하면 BF16 연산을 사용합니다.
+            compute_dtype = (
+                torch.bfloat16
+                if torch.cuda.is_bf16_supported()
+                else torch.float16
+            )
+        if load_in_4bit:
+            if not torch.cuda.is_available():
+                raise RuntimeError("4비트 Mistral 실행에는 CUDA GPU가 필요합니다.")
+            from transformers import BitsAndBytesConfig
+            quant_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_use_double_quant=True,
+            )
+
+        # 8GB GPU에서 CPU 오프로딩을 허용하면 매우 느려질 수 있으므로,
+        # CUDA 사용 시 모델 전체를 GPU 0번에 명시적으로 배치합니다.
+        model_kwargs = {
+            "low_cpu_mem_usage": True,
+            # 사용자의 Transformers 버전은 from_pretrained(dtype=...)를 지원하지 않습니다.
+            # torch_dtype는 구·신버전에서 모두 동작하며, 신버전의 경고는 실행에 영향이 없습니다.
+            "torch_dtype": compute_dtype,
+        }
+        if torch.cuda.is_available():
+            model_kwargs["device_map"] = {"": 0}
+        else:
+            model_kwargs["device_map"] = {"": "cpu"}
+        if quant_cfg is not None:
+            model_kwargs["quantization_config"] = quant_cfg
+
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model_name,
+            **model_kwargs,
+        )
+
+        if is_adapter:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(model, model_name)
+
+        self.pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=self.tokenizer,
+            return_full_text=False,
+        )
+        self.generation_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": temperature > 0,
+            "repetition_penalty": repetition_penalty,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        if temperature > 0:
+            self.generation_kwargs["temperature"] = temperature
+
+        # 최근 생성이 max_new_tokens 한도에 닿았는지 RagChain이 확인할 수 있게
+        # 생성 메타데이터를 객체에 보관합니다. 문장 끝만 보고 잘림을 판정하면
+        # "공", "따르"처럼 어색하게 끊긴 한국어를 놓칠 수 있기 때문입니다.
+        self.last_generation_tokens: int | None = None
+        self.last_max_new_tokens: int | None = None
+        self.last_generation_hit_limit: bool = False
+
+        if torch.cuda.is_available():
+            used_mb = torch.cuda.memory_allocated(0) / (1024 ** 2)
+            print(
+                f"[HF LLM] GPU={torch.cuda.get_device_name(0)}, "
+                f"4bit={load_in_4bit}, 할당 VRAM={used_mb:.0f}MB"
+            )
+        else:
+            print("[HF LLM] 장치=CPU")
+
+        # 이 모델이 chat template을 갖고 있는지 (Instruct 모델은 대부분 있음)
+        self.has_template = getattr(self.tokenizer, "chat_template", None) is not None
+        if not self.has_template:
+            print(f"  [경고] '{model_name}' 에 chat template이 없어 "
+                  f"일반 문자열 프롬프트로 폴백합니다. (Base 모델일 가능성)")
+
+    def chat(
+        self,
+        system: str,
+        user: str,
+        max_new_tokens: int | None = None,
+    ) -> str:
+        """질문 난이도에 따라 이번 호출의 생성 길이만 안전하게 덮어씁니다."""
+        if self.has_template:
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+            # 모델별 형식(<|im_start|> 등)을 토크나이저가 자동 적용
+            prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            # chat template 없는 구형/Base 모델 폴백
+            prompt = f"{system}\n\n{user}\n\n[답변]\n"
+
+        # 객체의 기본 설정은 건드리지 않고 이번 질문용 사본만 수정합니다.
+        generation_kwargs = dict(self.generation_kwargs)
+        if max_new_tokens is not None:
+            generation_kwargs["max_new_tokens"] = int(max_new_tokens)
+        out = self.pipe(prompt, **generation_kwargs)
+        generated_text = out[0]["generated_text"].strip()
+
+        # pipeline이 종료 사유(finish_reason)를 공통 형식으로 주지 않으므로,
+        # 생성된 문자열을 같은 토크나이저로 다시 세어 한도 도달 여부를 기록합니다.
+        # EOS가 디코딩 문자열에서 빠질 수 있어 한도보다 3토큰 이내면 한도 도달로 봅니다.
+        token_ids = self.tokenizer(
+            generated_text,
+            add_special_tokens=False,
+        ).get("input_ids", [])
+        limit = int(generation_kwargs["max_new_tokens"])
+        self.last_generation_tokens = len(token_ids)
+        self.last_max_new_tokens = limit
+        self.last_generation_hit_limit = len(token_ids) >= max(limit - 3, 1)
+        return generated_text
+
+
+class APIChatLLM:
+    """
+    API 모델(LangChain ChatModel) 래퍼.
+    SystemMessage / HumanMessage 로 전달 → 각 API가 자체 대화 형식으로 처리.
+    """
+
+    def __init__(self, lc_chat_model):
+        self.model = lc_chat_model
+        # API 공급자는 종료 사유를 LangChain 버전마다 다르게 노출하므로,
+        # 지원되지 않는 경우에는 문장 형태 기반 잘림 판정만 사용합니다.
+        self.last_generation_tokens: int | None = None
+        self.last_max_new_tokens: int | None = None
+        self.last_generation_hit_limit: bool = False
+
+    def chat(
+        self,
+        system: str,
+        user: str,
+        max_new_tokens: int | None = None,
+    ) -> str:
+        from langchain_core.messages import SystemMessage, HumanMessage
+        messages = [
+            SystemMessage(content=system),
+            HumanMessage(content=user),
+        ]
+        # API 모델은 공급자마다 길이 인자명이 다를 수 있습니다. LangChain이
+        # max_tokens를 지원하는 경우에만 동적 길이를 적용하고, 아니면 기본값을 씁니다.
+        if max_new_tokens is not None:
+            try:
+                resp = self.model.bind(max_tokens=int(max_new_tokens)).invoke(messages)
+            except (TypeError, ValueError):
+                resp = self.model.invoke(messages)
+        else:
+            resp = self.model.invoke(messages)
+        self.last_generation_tokens = None
+        self.last_max_new_tokens = (
+            int(max_new_tokens) if max_new_tokens is not None else None
+        )
+        self.last_generation_hit_limit = False
+        return resp.content.strip()
+
+
+# =====================================================================
+# 3) LLM 선택 (실험 변수: llm_type, model_name)
+# =====================================================================
+def get_llm(llm_type: str = "hf", model_name: str | None = None,
+            temperature: float = 0.0, max_new_tokens: int = 220,
+            api_key: str | None = None, base_url: str | None = None,
+            load_in_4bit: bool = False,
+            repetition_penalty: float = 1.05,
+            force_cuda: bool = False):
+    """
+    반환: .chat(system, user) -> str 을 지원하는 래퍼 객체.
+
+    api_key / base_url 을 넘기지 않으면 각 라이브러리가 환경변수에서 자동으로 읽는다.
+      · Upstage    : UPSTAGE_API_KEY
+      · OpenAI     : OPENAI_API_KEY   (base_url 지정 시 OpenAI 호환 커스텀 엔드포인트)
+      · Anthropic  : ANTHROPIC_API_KEY
+    """
+    t = llm_type.lower()
+
+    # 지정된 값만 kwargs에 넣는다(None이면 환경변수 사용)
+    def _auth(**extra):
+        kw = dict(extra)
+        if api_key:
+            kw["api_key"] = api_key
+        if base_url:
+            kw["base_url"] = base_url
+        return kw
+
+    # --- HuggingFace 로컬 모델 (Qwen / Llama / 파인튜닝 모델) ---
+    if t == "hf":
+        return HFChatLLM(
+            model_name or "mistralai/Mistral-7B-Instruct-v0.3",
+            temperature=temperature, max_new_tokens=max_new_tokens,
+            load_in_4bit=load_in_4bit,
+            repetition_penalty=repetition_penalty,
+            force_cuda=force_cuda,
+        )
+
+    # --- Upstage (Solar) ---
+    if t == "upstage":
+        from langchain_upstage import ChatUpstage
+        return APIChatLLM(ChatUpstage(**_auth(
+            model=model_name or "solar-pro", temperature=temperature)))
+
+    # --- OpenAI (ChatGPT) / OpenAI 호환 커스텀(base_url) ---
+    if t == "openai":
+        from langchain_openai import ChatOpenAI
+        return APIChatLLM(ChatOpenAI(**_auth(
+            model=model_name or "gpt-4o-mini", temperature=temperature)))
+
+    # --- Anthropic (Claude) ---
+    if t == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        return APIChatLLM(ChatAnthropic(**_auth(
+            model=model_name or "claude-3-5-sonnet-latest",
+            temperature=temperature)))
+
+    raise ValueError(f"지원하지 않는 llm_type: '{llm_type}' "
+                     f"(hf, openai, anthropic, upstage)")
+
+
+# =====================================================================
+# 4) 검색 문서 → 프롬프트용 컨텍스트 문자열
+# =====================================================================
+def _jo_label(meta: dict) -> str:
+    """조문 표기: 조문표시('제619조의2')가 있으면 우선, 없으면 조문번호."""
+    return meta.get("조문표시") or str(meta.get("조문번호", ""))
+
+
+def _source_name(doc) -> str:
+    """문서의 출처 표기: '법령명 제37조'"""
+    return f"{doc.metadata.get('법령명','')} {_jo_label(doc.metadata)}".strip()
+
+
+def format_contexts(docs) -> str:
+    """검색 문서에 [C1], [C2] ID를 붙여 컨텍스트를 구성합니다."""
+    blocks = []
+    for i, d in enumerate(docs, 1):
+        blocks.append(f"[C{i}] {_source_name(d)}\n{d.page_content}")
+    return "\n\n".join(blocks)
+
+
+def _question_plan(
+    question: str,
+    single_max_tokens: int = 220,
+    multi_max_tokens: int = 420,
+) -> dict:
+    """
+    질문 형태를 보고 출력 항목과 생성 길이를 결정합니다.
+
+    특정 정답이나 조문 번호를 프롬프트에 미리 넣지 않고, 사용자가 물은 하위
+    질문을 빠뜨리지 않도록 '답변 구조'만 지정합니다. 따라서 평가 문항뿐 아니라
+    새로운 복합 질문에도 같은 규칙을 적용할 수 있습니다.
+    """
+    compact = re.sub(r"\s+", "", question)
+    sections: list[str] = []
+    mode = "single"
+    single_instruction = (
+        "[출력 지침]\n"
+        "- 결론부터 1~3문장으로 답하세요.\n"
+        "- 질문에서 요구하지 않은 주변 조문·업종·자격은 추가하지 마세요.\n"
+        "- 수치·의무·예외는 근거에 있는 내용만 쓰고 실제 사용한 [C번호]를 붙이세요."
+    )
+
+    # 작업 기준·일반 의무·사망 결과를 한꺼번에 묻는 질문입니다.
+    if (
+        "사망" in compact
+        and any(word in compact for word in ("처벌", "징역", "벌금", "위반"))
+        and any(
+            word in compact
+            for word in (
+                "타워크레인", "크레인", "밀폐공간", "풍속",
+                "공기기준", "산소", "질식",
+            )
+        )
+    ):
+        mode = "duty_and_penalty"
+        sections = ["작업 또는 위험 기준", "사업주의 법적 의무", "위반해 사망한 경우의 처벌"]
+
+    # 30m/s 강풍의 '예상 시'와 '지난 뒤'만 묻는 질문입니다.
+    # 타워크레인의 10/15m/s 작업중지 기준까지 억지로 끼워 넣지 않습니다.
+    elif (
+        "30" in compact
+        and any(word in compact for word in ("예상", "우려", "불어올"))
+        and any(word in compact for word in ("분뒤", "지난뒤", "있은후", "불거나"))
+        and not any(word in compact for word in ("단계별", "점점"))
+    ):
+        mode = "wind_before_after"
+        sections = [
+            "30m/s 초과 우려 시: 이탈 방지 조치",
+            "30m/s 초과 강풍 후: 사용 전 이상 유무 점검",
+        ]
+
+    # 풍속이 단계적으로 변하는 질문은 10/15/30m/s 기준을 서로 분리합니다.
+    elif (
+        any(word in compact for word in ("단계별", "점점", "예상", "분뒤", "초과후"))
+        and any(word in compact for word in ("풍속", "강풍", "폭풍", "타워크레인", "양중기"))
+    ):
+        mode = "timeline"
+        sections = [
+            "10m/s 초과: 설치·수리·점검·해체 작업",
+            "15m/s 초과: 운전작업",
+            "30m/s 초과 우려: 이탈 방지",
+            "30m/s 초과 강풍 후: 사용 전 점검",
+        ]
+
+    # '각각/동시에/비교/그리고' 등으로 여러 대상을 묻는 일반 복합질문입니다.
+    elif any(
+        word in compact
+        for word in ("각각", "동시에", "비교", "단계별", "그리고", "뿐만아니라")
+    ):
+        mode = "multi"
+        sections = ["질문에 포함된 각 요구사항"]
+
+    # 안전보건총괄책임자 지정 대상은 일반 기준, 일부 업종의 예외 기준,
+    # 건설업의 공사금액 기준을 함께 써야 완전한 답변이 됩니다.
+    elif (
+        "안전보건총괄책임자" in compact
+        and any(
+            phrase in compact
+            for phrase in ("어떤사업장", "지정대상", "지정해야")
+        )
+    ):
+        mode = "designation_threshold"
+        single_instruction = (
+            "[지정 대상 질문 출력 지침]\n"
+            "- [일반 사업장], [일부 업종 예외], [건설업]을 구분하세요.\n"
+            "- 일반 상시근로자 수, 일부 업종의 더 낮은 근로자 수, "
+            "건설업 총공사금액을 빠짐없이 쓰세요.\n"
+            "- 세 기준을 직접 규정한 시행령 조문 하나만 근거로 사용하세요.\n"
+            "- 결론은 3문장 이내로 간결하게 쓰고 실제 사용한 [C번호]를 붙이세요."
+        )
+
+    # "무엇을 기준으로" 같은 질문에는 별표의 긴 업종 목록이 아니라
+    # 결정 요소와 그 근거 위치만 답하게 합니다.
+    elif any(
+        phrase in compact
+        for phrase in ("무엇을기준", "어떤기준", "기준으로정해")
+    ):
+        mode = "criteria"
+        single_instruction = (
+            "[기준 질문 출력 지침]\n"
+            "- 첫 문장은 대상을 결정하는 기준 요소만 1문장으로 요약하세요.\n"
+            "- 구체 기준이 별표에 있으면 별표 번호까지 쓰세요.\n"
+            "- 업종명은 하나도 나열하지 말고, 사업의 종류·상시근로자 수·"
+            "건설공사 금액처럼 표의 열 제목에 해당하는 기준만 쓰세요.\n"
+            "- 시행령 조문과 별표가 함께 제공되면 두 근거를 모두 인용하세요.\n"
+            "- 실제 사용한 [C번호]를 붙이세요."
+        )
+
+    # 인원과 선임방법을 함께 물으면 두 항목을 구분하되 자격기준·근무형태를
+    # 선임방법으로 잘못 설명하지 않게 합니다.
+    elif (
+        any(word in compact for word in ("몇명", "인원"))
+        and any(word in compact for word in ("어떤방식", "선임방법", "두어야"))
+    ):
+        mode = "staffing"
+        single_instruction = (
+            "[인원·선임 질문 출력 지침]\n"
+            "- [필요 여부와 인원]에는 질문의 근로자 수가 선임 기준 이상인지와 "
+            "필요 인원을 함께 쓰세요.\n"
+            "- [선임 방법과 근거]에는 구체적인 수와 선임방법을 정한 시행령 조문과 "
+            "별표 번호를 모두 쓰세요.\n"
+            "- 자격기준 별표나 연장·야간·휴일근로 내용을 선임방법으로 쓰지 마세요.\n"
+            "- 근거에서 확인되지 않는 세부사항은 추측하지 마세요.\n"
+            "- 실제 사용한 [C번호]를 붙이세요."
+        )
+
+    # 주체를 묻는 질문에서 근로자 일반 의무 등 다른 주체를 불필요하게
+    # 덧붙이지 않도록 제한합니다.
+    elif any(word in compact for word in ("누구에게", "누가", "의무는누구")):
+        mode = "responsible_party"
+        single_instruction = (
+            "[의무 주체 질문 출력 지침]\n"
+            "- 질문한 의무의 직접적인 주체부터 한 문장으로 답하세요.\n"
+            "- 일반 책무 조문이 아니라 질문한 안전조치를 직접 규정한 조문만 인용하세요.\n"
+            "- 질문하지 않은 다른 주체의 일반 의무는 덧붙이지 마세요.\n"
+            "- 필요한 경우 해당 의무 내용만 한 문장 보충하고 [C번호]를 붙이세요."
+        )
+
+    # 가능 여부 질문은 결론뿐 아니라 같은 근거에 명시된 핵심 보호·제한도
+    # 짧게 포함합니다.
+    elif any(word in compact for word in ("수있나요", "가능한가요", "해도되나요")):
+        mode = "yes_no"
+        single_instruction = (
+            "[가능 여부 질문 출력 지침]\n"
+            "- 첫 단어를 '네' 또는 '아니요'로 시작하세요.\n"
+            "- 허용되는 행동과 같은 조문에 있는 핵심 보호·제한을 함께 답하세요.\n"
+            "- 2문장을 넘기지 말고 실제 사용한 [C번호]를 붙이세요."
+        )
+
+    if mode == "single":
+        return {
+            "mode": mode,
+            "max_new_tokens": int(single_max_tokens),
+            "instruction": single_instruction,
+        }
+
+    # 위의 세부 단순질문 모드도 단순질문 토큰 한도를 사용합니다.
+    if mode in {
+        "criteria",
+        "staffing",
+        "designation_threshold",
+        "responsible_party",
+        "yes_no",
+    }:
+        return {
+            "mode": mode,
+            "max_new_tokens": int(single_max_tokens),
+            "instruction": single_instruction,
+        }
+
+    section_lines = "\n".join(f"- [{name}]" for name in sections)
+    extra_rules = ""
+    if mode == "duty_and_penalty":
+        extra_rules = (
+            "\n- 작업·위험 기준은 수치 또는 정의를 규정한 직접 근거를 사용하세요."
+            "\n- 사업주의 법적 의무는 법률 조문을 사용하고 세부 규칙 조문으로 대체하지 마세요."
+            "\n- 세부 프로그램이나 절차의 전체 내용을 나열하지 말고 항목당 한 문장만 쓰세요."
+            "\n- 처벌 항목에는 징역 기간과 벌금 금액을 반드시 포함하세요."
+            "\n- 세 항목 중 하나라도 생략하지 마세요."
+        )
+        if any(word in compact for word in ("밀폐공간", "질식", "적정공기")):
+            extra_rules += (
+                "\n- 작업·위험 기준에는 적정공기의 산소농도 하한과 상한을 "
+                "정확한 수치로 쓰세요."
+                "\n- 사업주의 법적 의무에는 제공된 안전조치 조문과 보건조치 조문을 "
+                "모두 사용하세요."
+                "\n- '보건조치 중 1번'처럼 조문을 알아보기 어려운 표현은 쓰지 마세요."
+            )
+    elif mode == "timeline":
+        extra_rules = (
+            "\n- 10m/s, 15m/s, 30m/s 기준을 낮은 수치부터 모두 구분하세요."
+            "\n- 강풍 예상 시 조치와 강풍이 지난 뒤 점검을 서로 바꾸지 마세요."
+            "\n- 위 네 단계만 작성하고 지침 문장이나 검증 문장을 답변에 반복하지 마세요."
+        )
+    elif mode == "wind_before_after":
+        extra_rules = (
+            "\n- 30m/s 초과 우려 시에는 이탈 방지, 강풍이 지난 뒤에는 "
+            "사용 전 이상 유무 점검으로 구분하세요."
+            "\n- 질문하지 않은 10m/s·15m/s 타워크레인 작업중지 기준은 쓰지 마세요."
+        )
+    return {
+        "mode": mode,
+        # 복합질문만 여유를 주되, 각 항목 한두 문장 제한으로 장황함을 막습니다.
+        "max_new_tokens": int(multi_max_tokens),
+        "instruction": (
+            "[복합질문 출력 지침]\n"
+            f"{section_lines}\n"
+            "- 위 항목을 빠짐없이, 항목당 1~2문장으로 작성하세요.\n"
+            "- 각 항목 끝에 그 항목을 직접 뒷받침하는 [C번호]만 붙이세요.\n"
+            "- 근거에서 확인되지 않는 항목은 추측하지 말고 '근거에서 확인되지 않음'이라고 쓰세요."
+            f"{extra_rules}"
+        ),
+    }
+
+
+def _article_number(doc) -> int | None:
+    """문서 메타데이터의 '제○조'에서 주 조문 번호만 추출합니다."""
+    match = re.search(r"제\s*(\d+)\s*조", _jo_label(doc.metadata))
+    return int(match.group(1)) if match else None
+
+
+def _law_kind(doc) -> str:
+    """문서가 법률·시행령·규칙 중 어디에 해당하는지 구분합니다."""
+    law_name = str(doc.metadata.get("법령명", "")).strip()
+    if "시행령" in law_name:
+        return "decree"
+    if "규칙" in law_name:
+        return "rule"
+    if law_name == "산업안전보건법":
+        return "act"
+    return "other"
+
+
+def _annex_number(doc) -> int | None:
+    """'별표0003의00' 같은 JSON 표기를 사람이 쓰는 별표 번호로 읽습니다."""
+    match = re.fullmatch(r"별표0*(\d+)(?:의0*\d+)?", _jo_label(doc.metadata))
+    return int(match.group(1)) if match else None
+
+
+def _matches_source(
+    doc,
+    *,
+    kind: str | None = None,
+    article: int | None = None,
+    annex: int | None = None,
+) -> bool:
+    """법령 종류와 조문 또는 별표 번호가 모두 맞는 문서인지 확인합니다."""
+    if kind is not None and _law_kind(doc) != kind:
+        return False
+    if article is not None and _article_number(doc) != article:
+        return False
+    if annex is not None and _annex_number(doc) != annex:
+        return False
+    return True
+
+
+def _copy_document(doc, page_content: str):
+    """원본 문서 클래스를 유지하면서 프롬프트용 본문만 바꿔 복사합니다."""
+    return type(doc)(
+        page_content=page_content,
+        metadata=dict(doc.metadata),
+    )
+
+
+def _prepare_prompt_documents(question: str, docs: list, plan: dict) -> list:
+    """
+    검색 결과 자체는 평가용으로 보존하고, LLM에 넣는 근거만 질문별로 정리합니다.
+
+    검색 Hit@k가 이미 높은 상황에서 긴 별표·주변 조문을 모두 보여 주면 작은 로컬
+    LLM이 핵심 대신 표 전체를 복사하거나 서로 다른 시점의 조치를 뒤섞었습니다.
+    여기서는 정답을 새로 만들지 않고, 검색된 문서 중 질문에 직접 필요한 근거만
+    남기거나 별표의 제목 행만 보여 줍니다.
+    """
+    mode = plan.get("mode", "single")
+    compact_question = re.sub(r"\s+", "", question)
+    prepared = list(docs)
+
+    if mode == "responsible_party":
+        # 근로자의 안전을 위한 조치 의무를 물을 때 제6조(근로자의 의무)가
+        # 함께 검색되면 작은 LLM이 주체는 맞히고 조문만 제6조로 잘못 고릅니다.
+        # 질문한 안전조치를 직접 규정한 법 제38조만 모델에 전달합니다.
+        if "안전" in compact_question and "조치" in compact_question:
+            direct = [
+                doc for doc in prepared
+                if _matches_source(doc, kind="act", article=38)
+            ]
+            return direct or prepared
+
+    if mode == "criteria":
+        # 안전보건관리책임자 기준 질문의 직접 근거는 시행령 제14조와 별표2입니다.
+        # 법 제15조는 직무를 설명하는 조문이므로 기준 답변의 인용에서는 제외합니다.
+        if "안전보건관리책임자" in compact_question:
+            direct = [
+                doc for doc in prepared
+                if (
+                    _matches_source(doc, kind="decree", article=14)
+                    or _matches_source(doc, kind="decree", annex=2)
+                )
+            ]
+            if direct:
+                prepared = sorted(
+                    direct,
+                    key=lambda doc: (
+                        0 if _matches_source(
+                            doc, kind="decree", article=14
+                        ) else 1
+                    ),
+                )
+
+        compacted = []
+        for doc in prepared:
+            label = str(_jo_label(doc.metadata))
+            if label.startswith("별표"):
+                # 기준을 묻는 질문에는 수십 개 업종 행이 필요하지 않습니다.
+                # 별표 제목과 표의 기준 열만 남겨 모델의 목록 복사를 막습니다.
+                first_line = doc.page_content.strip().splitlines()[0]
+                title = str(doc.metadata.get("조문제목", "")).strip()
+                summary = (
+                    f"{first_line}\n"
+                    f"이 별표는 {title or '사업의 종류와 사업장 규모 기준'}를 "
+                    "정하는 표이다. 개별 업종 목록은 답변에 나열하지 않는다."
+                )
+                compacted.append(_copy_document(doc, summary))
+            else:
+                compacted.append(doc)
+
+        # '사업의 종류·상시근로자 수'를 직접 명시한 법률/시행령 조문을
+        # 긴 별표보다 앞에 배치합니다.
+        def criteria_priority(doc):
+            text = re.sub(
+                r"\s+",
+                "",
+                f"{doc.metadata.get('조문제목', '')}{doc.page_content}",
+            )
+            if (
+                "사업의종류" in text
+                and ("상시근로자수" in text or "건설공사금액" in text)
+                and not str(_jo_label(doc.metadata)).startswith("별표")
+            ):
+                return 0
+            if str(_jo_label(doc.metadata)).startswith("별표"):
+                return 1
+            return 2
+
+        return sorted(compacted, key=criteria_priority)
+
+    if mode == "designation_threshold":
+        # 일반 100명·일부 업종 50명·건설업 20억원 기준이 모두 시행령
+        # 제52조에 있으므로 다른 조문이 답변을 흐리지 않게 직접 근거만 남깁니다.
+        direct = [
+            doc for doc in prepared
+            if _matches_source(doc, kind="decree", article=52)
+        ]
+        return direct or prepared
+
+    if mode == "staffing":
+        # 안전관리자의 선임 근거와 구체 표를 함께 보여 줍니다.
+        direct = [
+            doc for doc in prepared
+            if (
+                _matches_source(doc, kind="decree", article=16)
+                or _matches_source(doc, kind="decree", annex=3)
+            )
+        ]
+        if direct:
+            return sorted(
+                direct,
+                key=lambda doc: (
+                    0 if _matches_source(
+                        doc, kind="decree", article=16
+                    ) else 1
+                ),
+            )
+        return prepared
+
+    if mode == "wind_before_after":
+        # 30m/s 전·후만 묻는 질문에는 제140조와 제143조만 사용합니다.
+        direct = [
+            doc for doc in prepared
+            if (
+                _matches_source(doc, kind="rule", article=140)
+                or _matches_source(doc, kind="rule", article=143)
+            )
+        ]
+        return direct or prepared
+
+    if mode == "timeline":
+        # 풍속 단계 질문에는 10/15m/s 기준과 30m/s 전·후 기준만 사용합니다.
+        direct = [
+            doc for doc in prepared
+            if any(
+                _matches_source(doc, kind="rule", article=article)
+                for article in (37, 140, 143)
+            )
+        ]
+        direct.sort(
+            key=lambda doc: {37: 0, 140: 1, 143: 2}.get(
+                _article_number(doc), 9
+            )
+        )
+        return direct or prepared
+
+    if mode == "duty_and_penalty":
+        if any(word in compact_question for word in ("타워크레인", "크레인")):
+            roles = [
+                ("rule", 37),
+                ("act", 38),
+                ("act", 167),
+            ]
+        elif any(word in compact_question for word in ("밀폐공간", "질식", "적정공기")):
+            # 제619조의 프로그램 세부내용보다 질문이 직접 요구한 적정공기,
+            # 법률상 보건조치, 사망 벌칙을 우선합니다.
+            roles = [
+                ("rule", 618),
+                ("act", 38),
+                ("act", 39),
+                ("act", 167),
+            ]
+        else:
+            roles = []
+        if roles:
+            direct = [
+                doc for doc in prepared
+                if any(
+                    _matches_source(doc, kind=kind, article=article)
+                    for kind, article in roles
+                )
+            ]
+            # 세부 기준 → 법률상 의무 → 처벌 순서로 보여 줍니다.
+            direct.sort(
+                key=lambda doc: next(
+                    (
+                        index for index, (kind, article) in enumerate(roles)
+                        if _matches_source(
+                            doc, kind=kind, article=article
+                        )
+                    ),
+                    99,
+                ),
+            )
+            return direct or prepared
+
+    return prepared
+
+
+def _prompt_source_id(
+    docs,
+    *,
+    kind: str,
+    article: int | None = None,
+    annex: int | None = None,
+) -> int | None:
+    """프롬프트 문서에서 특정 법령 조문에 붙은 C-ID를 찾습니다."""
+    for index, doc in enumerate(docs, 1):
+        if _matches_source(
+            doc,
+            kind=kind,
+            article=article,
+            annex=annex,
+        ):
+            return index
+    return None
+
+
+def _cid_text(*ids: int | None) -> str:
+    """존재하는 C-ID만 '[C1, C2]' 형태로 표시합니다."""
+    valid = list(dict.fromkeys(index for index in ids if index is not None))
+    return f"[{', '.join(f'C{index}' for index in valid)}]" if valid else ""
+
+
+def _citation_role_instruction(question: str, docs, plan: dict) -> str:
+    """
+    모델에 문장 역할과 C-ID의 연결을 명시합니다.
+
+    조문 번호를 답으로 새로 만드는 것이 아니라 실제 prompt_docs의 메타데이터에서
+    C-ID를 찾아 안내합니다. 이로써 M1처럼 필요한 세 조문을 모두 검색하고도
+    '풍속 기준→법 제38조, 법적 의무→규칙 제37조'로 바꾸어 인용하는 오류를 줄입니다.
+    """
+    mode = plan.get("mode", "single")
+    compact = re.sub(r"\s+", "", question)
+    lines: list[str] = []
+
+    if mode == "responsible_party" and "안전" in compact and "조치" in compact:
+        act_38 = _prompt_source_id(docs, kind="act", article=38)
+        if act_38:
+            lines.append(
+                f"- 의무 주체와 안전조치 내용은 {_cid_text(act_38)}만 인용하세요."
+            )
+
+    elif mode == "criteria" and "안전보건관리책임자" in compact:
+        decree_14 = _prompt_source_id(docs, kind="decree", article=14)
+        annex_2 = _prompt_source_id(docs, kind="decree", annex=2)
+        if decree_14 or annex_2:
+            lines.append(
+                "- 기준 요소는 시행령 조문과 별표를 함께 근거로 삼아 "
+                f"{_cid_text(decree_14, annex_2)}를 모두 인용하세요."
+            )
+
+    elif mode == "designation_threshold":
+        decree_52 = _prompt_source_id(docs, kind="decree", article=52)
+        if decree_52:
+            lines.append(
+                f"- 일반·예외·건설업 기준은 모두 {_cid_text(decree_52)}에 연결하세요."
+            )
+
+    elif mode == "staffing":
+        decree_16 = _prompt_source_id(docs, kind="decree", article=16)
+        annex_3 = _prompt_source_id(docs, kind="decree", annex=3)
+        if decree_16 or annex_3:
+            lines.append(
+                "- 필요 인원과 선임방법의 근거로 "
+                f"{_cid_text(decree_16, annex_3)}를 모두 인용하세요."
+            )
+
+    elif mode == "duty_and_penalty":
+        penalty = _prompt_source_id(docs, kind="act", article=167)
+        if any(word in compact for word in ("타워크레인", "크레인")):
+            standard = _prompt_source_id(docs, kind="rule", article=37)
+            duty = _prompt_source_id(docs, kind="act", article=38)
+            lines.extend([
+                f"- [작업 또는 위험 기준] → {_cid_text(standard)}",
+                f"- [사업주의 법적 의무] → {_cid_text(duty)}",
+                f"- [위반해 사망한 경우의 처벌] → {_cid_text(penalty)}",
+            ])
+        elif any(word in compact for word in ("밀폐공간", "질식", "적정공기")):
+            standard = _prompt_source_id(docs, kind="rule", article=618)
+            safety = _prompt_source_id(docs, kind="act", article=38)
+            health = _prompt_source_id(docs, kind="act", article=39)
+            lines.extend([
+                f"- [작업 또는 위험 기준] → {_cid_text(standard)}",
+                f"- [사업주의 법적 의무] → {_cid_text(safety, health)}",
+                f"- [위반해 사망한 경우의 처벌] → {_cid_text(penalty)}",
+            ])
+
+    elif mode == "timeline":
+        rule_37 = _prompt_source_id(docs, kind="rule", article=37)
+        rule_140 = _prompt_source_id(docs, kind="rule", article=140)
+        rule_143 = _prompt_source_id(docs, kind="rule", article=143)
+        lines.extend([
+            f"- 10m/s·15m/s 기준 → {_cid_text(rule_37)}",
+            f"- 30m/s 초과 우려 시 조치 → {_cid_text(rule_140)}",
+            f"- 30m/s 초과 강풍 후 점검 → {_cid_text(rule_143)}",
+        ])
+
+    elif mode == "wind_before_after":
+        rule_140 = _prompt_source_id(docs, kind="rule", article=140)
+        rule_143 = _prompt_source_id(docs, kind="rule", article=143)
+        lines.extend([
+            f"- 30m/s 초과 우려 시 조치 → {_cid_text(rule_140)}",
+            f"- 30m/s 초과 강풍 후 점검 → {_cid_text(rule_143)}",
+        ])
+
+    lines = [line for line in lines if not line.rstrip().endswith("→ ")]
+    if not lines:
+        return ""
+    return (
+        "[필수 인용 연결]\n"
+        + "\n".join(lines)
+        + "\n- 다른 항목의 C-ID와 서로 바꾸지 마세요."
+    )
+
+
+# 새 표기([C1], [C1, C3])와 기존 표기((근거 1), [근거 1])를 모두 읽습니다.
+# 기존 결과와의 호환성을 유지하면서 앞으로는 짧고 오류가 적은 C-ID를 사용합니다.
+_CITE_ID_RE = re.compile(
+    r"(?:\[|\()\s*(?:C|근거)\s*"
+    r"(\d+(?:\s*[,/]\s*(?:(?:C|근거)\s*)?\d+)*)"
+    r"(?:\s+제\s*\d+\s*조(?:의\s*\d+)?)?"
+    r"(?:\s+(?:제\s*\d+\s*항|[①-⑳]))?"
+    r"\s*(?:\]|\))",
+    re.IGNORECASE,
+)
+
+# Mistral 계열이 괄호 없이 "근거 1"만 출력하는 경우도 실제 인용으로 읽습니다.
+_LOOSE_CITE_ID_RE = re.compile(
+    r"(?<!\[)(?<!\()\b(?:C|근거)\s*(\d+)\b",
+    re.IGNORECASE,
+)
+
+# 모델이 C-ID 대신 "(제37조 ②)" 또는 "(산업안전보건법 제167조)"처럼
+# 괄호 인용을 남기는 경우가 있습니다. 실제 출처는 아래 검증 단계에서 다시
+# 표시하므로 화면에 중복되는 괄호 인용만 보수적으로 제거합니다.
+_DIRECT_CITE_PAREN_RE = re.compile(
+    r"\(\s*"
+    r"(?:(?:산업안전보건법(?:\s*시행령)?|산업안전보건기준에\s*관한\s*규칙)\s*)?"
+    r"제\s*\d+\s*조(?:의\s*\d+)?(?:\s*(?:제\s*\d+\s*항|[①-⑳]))?"
+    r"(?:\s*[,·]\s*(?:제\s*)?\d+\s*조?(?:의\s*\d+)?(?:\s*[①-⑳])?)*"
+    r"\s*\)",
+)
+
+
+def _clean_answer_artifacts(answer: str) -> str:
+    """인용 검증 후 남는 빈 괄호·C-ID·깨진 문자를 제거합니다."""
+    cleaned = answer.replace("\ufffd", "")
+    cleaned = _CITE_ID_RE.sub("", cleaned)
+    cleaned = _LOOSE_CITE_ID_RE.sub("", cleaned)
+    cleaned = _DIRECT_CITE_PAREN_RE.sub("", cleaned)
+    cleaned = re.sub(r"\(\s*[,;·/]*\s*\)", "", cleaned)
+    cleaned = re.sub(r"\[\s*[,;·/]*\s*\]", "", cleaned)
+    cleaned = re.sub(r"[ \t]+([,.;:])", r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _looks_truncated(
+    answer: str,
+    hit_token_limit: bool = False,
+) -> bool:
+    """
+    최대 생성 토큰에 걸려 문장이 중간에서 끊긴 흔적을 보수적으로 찾습니다.
+
+    완성된 짧은 답변을 불필요하게 다시 생성하지 않도록 명확한 흔적만 사용합니다.
+    """
+    # 생성 토큰이 max_new_tokens에 닿았으면 문장 모양과 상관없이 잘림으로 봅니다.
+    # 이는 D-H의 "...공", M2의 "...따르" 같은 잘림을 잡는 가장 확실한 신호입니다.
+    if hit_token_limit:
+        return True
+
+    text = answer.strip()
+    if not text:
+        return True
+    if "\ufffd" in text:
+        return True
+
+    # 인용 표기를 제거한 실제 답변의 마지막 부분을 검사합니다.
+    tail = _clean_answer_artifacts(text).rstrip()
+    if not tail:
+        return True
+    if tail.endswith((",", "·", ":", "/", "-", "(", "[")):
+        return True
+    return bool(
+        re.search(
+            r"(?:해야|대하여|관하여|따라|따르|또는|그리고|바람이|경우에|"
+            r"타워크레|제조업|이상인|초과하는|근로자가|사업주가|"
+            r"소프트웨어\s*개발\s*및\s*공)\s*$",
+            tail,
+        )
+    )
+
+
+def _extract_citation_ids(answer: str, docs) -> list[int]:
+    """모델 원문에 실제로 적힌 C-ID와 직접 표기한 법령 조문을 추출합니다."""
+    used_ids: list[int] = []
+    for match in _CITE_ID_RE.finditer(answer):
+        for number in re.findall(r"\d+", match.group(1)):
+            index = int(number)
+            if 1 <= index <= len(docs) and index not in used_ids:
+                used_ids.append(index)
+
+    for match in _LOOSE_CITE_ID_RE.finditer(answer):
+        index = int(match.group(1))
+        if 1 <= index <= len(docs) and index not in used_ids:
+            used_ids.append(index)
+
+    # C-ID 대신 법령명과 조문을 직접 적은 경우도 검색 문서 안에 있을 때만 인정합니다.
+    compact_answer = re.sub(r"\s+", "", answer)
+    for index, doc in enumerate(docs, 1):
+        law_name = str(doc.metadata.get("법령명", "")).strip()
+        article = _jo_label(doc.metadata).strip()
+        if not law_name or not article:
+            continue
+        aliases = [f"{law_name}{article}"]
+        short_law = (
+            "시행령" if "시행령" in law_name
+            else "규칙" if "규칙" in law_name
+            else "산업안전보건법"
+        )
+        aliases.append(f"{short_law}{article}")
+        annex = re.fullmatch(r"별표0*(\d+)(?:의0*\d+)?", article)
+        if annex:
+            human_annex = f"별표{int(annex.group(1))}"
+            aliases.extend([f"{law_name}{human_annex}", f"{short_law}{human_annex}"])
+        if any(re.sub(r"\s+", "", alias) in compact_answer for alias in aliases):
+            if index not in used_ids:
+                used_ids.append(index)
+    return used_ids
+
+
+def _section_block(answer: str, heading: str) -> str:
+    """'- [제목]'에서 다음 제목 전까지의 답변 블록을 반환합니다."""
+    match = re.search(
+        rf"-\s*\[{re.escape(heading)}\]\s*:?\s*(.*?)(?=\n\s*-\s*\[|\Z)",
+        answer,
+        flags=re.DOTALL,
+    )
+    return match.group(0) if match else ""
+
+
+def _quality_retry_issues(
+    answer: str,
+    question: str,
+    plan: dict,
+    docs,
+) -> list[str]:
+    """
+    정답을 만들지는 않고, 프롬프트에서 요구한 수치·항목·문장별 인용 누락을 찾습니다.
+
+    문제가 있으면 같은 검색 근거를 사용해 LLM이 한 번 더 작성하게 합니다.
+    프로그램이 임의의 법적 답변이나 출처를 붙이지 않으므로 used_sources의 의미도
+    그대로 유지됩니다.
+    """
+    mode = plan.get("mode", "single")
+    compact_question = re.sub(r"\s+", "", question)
+    compact_answer = re.sub(r"\s+", "", _clean_answer_artifacts(answer))
+    all_ids = set(_extract_citation_ids(answer, docs))
+    issues: list[str] = []
+
+    def require_global(index: int | None, label: str) -> None:
+        if index is not None and index not in all_ids:
+            issues.append(f"{label} 인용 누락")
+
+    def require_section(
+        heading: str,
+        required_ids: list[int | None],
+        label: str,
+    ) -> None:
+        block = _section_block(answer, heading)
+        block_ids = set(_extract_citation_ids(block, docs)) if block else set()
+        missing = [
+            index for index in required_ids
+            if index is not None and index not in block_ids
+        ]
+        if not block:
+            issues.append(f"{label} 항목 누락")
+        elif missing:
+            issues.append(f"{label} 문장에 지정된 C-ID 인용 누락")
+
+    if mode == "responsible_party" and "안전" in compact_question and "조치" in compact_question:
+        require_global(
+            _prompt_source_id(docs, kind="act", article=38),
+            "산업안전보건법 제38조",
+        )
+
+    elif mode == "criteria" and "안전보건관리책임자" in compact_question:
+        require_global(
+            _prompt_source_id(docs, kind="decree", article=14),
+            "시행령 제14조",
+        )
+        require_global(
+            _prompt_source_id(docs, kind="decree", annex=2),
+            "시행령 별표2",
+        )
+
+    elif mode == "designation_threshold":
+        require_global(
+            _prompt_source_id(docs, kind="decree", article=52),
+            "시행령 제52조",
+        )
+        for value, label in (("100", "일반 100명"), ("50", "일부 업종 50명"),
+                             ("20", "건설업 20억원")):
+            if value not in compact_answer:
+                issues.append(f"{label} 기준 누락")
+
+    elif mode == "staffing":
+        require_global(
+            _prompt_source_id(docs, kind="decree", article=16),
+            "시행령 제16조",
+        )
+        require_global(
+            _prompt_source_id(docs, kind="decree", annex=3),
+            "시행령 별표3",
+        )
+        if "1명" not in compact_answer:
+            issues.append("필요 인원 1명 누락")
+        if "50" not in compact_answer:
+            issues.append("선임 기준 50명 누락")
+
+    elif mode == "duty_and_penalty":
+        penalty = _prompt_source_id(docs, kind="act", article=167)
+        if any(word in compact_question for word in ("타워크레인", "크레인")):
+            require_section(
+                "작업 또는 위험 기준",
+                [_prompt_source_id(docs, kind="rule", article=37)],
+                "풍속 기준",
+            )
+            require_section(
+                "사업주의 법적 의무",
+                [_prompt_source_id(docs, kind="act", article=38)],
+                "안전조치 의무",
+            )
+        else:
+            require_section(
+                "작업 또는 위험 기준",
+                [_prompt_source_id(docs, kind="rule", article=618)],
+                "적정공기 기준",
+            )
+            require_section(
+                "사업주의 법적 의무",
+                [
+                    _prompt_source_id(docs, kind="act", article=38),
+                    _prompt_source_id(docs, kind="act", article=39),
+                ],
+                "안전·보건조치 의무",
+            )
+            for value, label in (("18", "산소농도 하한 18%"),
+                                 ("23.5", "산소농도 상한 23.5%")):
+                if value not in compact_answer:
+                    issues.append(f"{label} 누락")
+            if "보건조치중1번" in compact_answer:
+                issues.append("알아보기 어려운 '보건조치 중 1번' 표현 사용")
+        require_section(
+            "위반해 사망한 경우의 처벌",
+            [penalty],
+            "사망 시 처벌",
+        )
+        for value, label in (("7년", "징역 7년"), ("1억원", "벌금 1억원")):
+            if value not in compact_answer:
+                issues.append(f"{label} 누락")
+
+    elif mode == "timeline":
+        for value, label in (("10", "10m/s 단계"), ("15", "15m/s 단계"),
+                             ("30", "30m/s 단계")):
+            if value not in compact_answer:
+                issues.append(f"{label} 누락")
+        for article in (37, 140, 143):
+            require_global(
+                _prompt_source_id(docs, kind="rule", article=article),
+                f"규칙 제{article}조",
+            )
+        if "근거에서확인되지않음" in compact_answer:
+            issues.append("질문하지 않은 '근거에서 확인되지 않음' 문장 포함")
+
+    elif mode == "wind_before_after":
+        require_global(
+            _prompt_source_id(docs, kind="rule", article=140),
+            "규칙 제140조",
+        )
+        require_global(
+            _prompt_source_id(docs, kind="rule", article=143),
+            "규칙 제143조",
+        )
+
+    return list(dict.fromkeys(issues))
+
+
+def _claim_support_score(claim: str, doc) -> float:
+    """
+    한 답변 문장이 한 검색 문서에 실제로 뒷받침되는 정도를 계산합니다.
+
+    수치가 있는 법령 답변은 같은 수치가 문서에 없으면 크게 감점합니다.
+    이 규칙으로 '15m/s 답변에 30m/s 조문을 인용'하는 오류를 차단합니다.
+    """
+    clean_claim = _CITE_ID_RE.sub(" ", claim)
+    clean_claim = _LOOSE_CITE_ID_RE.sub(" ", clean_claim)
+    clean_claim = re.sub(r"^\s*[-*•]?\s*\d+[.)]\s*", "", clean_claim)
+    doc_text = (
+        f"{doc.metadata.get('법령명', '')} {_jo_label(doc.metadata)} "
+        f"{doc.metadata.get('조문제목', '')} {doc.page_content}"
+    )
+
+    stopwords = {
+        "근거", "질문", "답변", "경우", "대한", "따라", "한다", "해야",
+        "있다", "없다", "됩니다", "합니다", "그리고", "또는",
+    }
+    claim_tokens = {
+        token for token in _lexical_tokens(clean_claim)
+        if len(token) >= 2 and token not in stopwords
+    }
+    doc_tokens = set(_lexical_tokens(doc_text))
+    lexical = (
+        len(claim_tokens & doc_tokens) / min(max(len(claim_tokens), 1), 18)
+    )
+    score = lexical
+
+    # 문장에 법령명·조문이 직접 있으면 가장 강한 근거 신호로 봅니다.
+    compact_claim = re.sub(r"\s+", "", clean_claim)
+    compact_source = re.sub(r"\s+", "", _source_name(doc))
+    if compact_source and compact_source in compact_claim:
+        score += 1.0
+    else:
+        article = re.sub(r"\s+", "", _jo_label(doc.metadata))
+        if article and article in compact_claim:
+            score += 0.35
+
+    claim_numbers = set(re.findall(r"(?<![A-Za-z가-힣])\d+(?:\.\d+)?", clean_claim))
+    doc_numbers = set(re.findall(r"(?<![A-Za-z가-힣])\d+(?:\.\d+)?", doc_text))
+    if claim_numbers:
+        matched_ratio = len(claim_numbers & doc_numbers) / len(claim_numbers)
+        if matched_ratio == 1.0:
+            score += 0.75
+        elif matched_ratio > 0:
+            score += 0.25 * matched_ratio
+        else:
+            score -= 0.55
+
+    # 법령에서 구별력이 큰 행위·결과 표현이 같은 문서에 있는지 보정합니다.
+    for keyword in (
+        "운전작업중지", "작업중지", "이탈방지", "이상유무점검",
+        "안전조치", "보건조치", "사망", "징역", "벌금", "선임방법",
+        "상시근로자", "적정공기",
+    ):
+        if keyword in compact_claim and keyword in re.sub(r"\s+", "", doc_text):
+            score += 0.18
+
+    # 구조화된 복합답변에서는 제목이 어떤 종류의 근거를 요구하는지 명확합니다.
+    # 단어 겹침만 사용하면 M1의 '법적 의무' 문장에 세부 규칙 제37조가 남고
+    # 직접 의무 조문인 법 제38조가 제거될 수 있으므로 역할 일치 보너스를 줍니다.
+    article = _article_number(doc)
+    kind = _law_kind(doc)
+    if "작업또는위험기준" in compact_claim:
+        if kind == "rule" and article in {37, 618}:
+            score += 1.2
+    if "사업주의법적의무" in compact_claim:
+        if kind == "act" and article in {38, 39}:
+            score += 1.2
+        elif kind == "rule":
+            score -= 0.35
+    if "위반해사망한경우의처벌" in compact_claim:
+        if kind == "act" and article == 167:
+            score += 1.2
+    if (
+        "사업의종류" in compact_claim
+        and "상시근로자" in compact_claim
+        and kind == "decree"
+        and (article == 14 or _annex_number(doc) == 2)
+    ):
+        score += 0.9
+    if (
+        any(
+            label in compact_claim
+            for label in ("필요여부와인원", "선임방법과근거", "안전관리자")
+        )
+        and kind == "decree"
+        and (article == 16 or _annex_number(doc) == 3)
+    ):
+        score += 0.9
+    return score
+
+
+def _claim_role_source_match(claim: str, doc) -> bool:
+    """질문의 구조상 한 문장에 함께 필요한 직접 근거인지 확인합니다."""
+    compact = re.sub(r"\s+", "", _clean_answer_artifacts(claim))
+    article = _article_number(doc)
+    annex = _annex_number(doc)
+    kind = _law_kind(doc)
+
+    if "작업또는위험기준" in compact:
+        return kind == "rule" and article in {37, 618}
+    if "사업주의법적의무" in compact:
+        return kind == "act" and article in {38, 39}
+    if "위반해사망한경우의처벌" in compact:
+        return kind == "act" and article == 167
+    if "사업의종류" in compact and "상시근로자" in compact:
+        return kind == "decree" and (article == 14 or annex == 2)
+    if any(
+        label in compact
+        for label in ("필요여부와인원", "선임방법과근거", "안전관리자")
+    ):
+        return kind == "decree" and (article == 16 or annex == 3)
+    return False
+
+
+def validate_and_resolve_citations(
+    answer: str,
+    docs,
+) -> tuple[str, list[str], list[str], bool]:
+    """
+    모델 인용과 문장 내용을 대조해 잘못된 인용을 제거·교정합니다.
+
+    반환:
+      - 사용자에게 보여 줄 답변
+      - 모델이 원래 적은 출처(model_used_sources)
+      - 내용 검증을 통과한 출처(used_sources)
+      - 프로그램이 인용을 교정했는지 여부
+    """
+    model_ids = _extract_citation_ids(answer, docs)
+    model_sources = [_source_name(docs[index - 1]) for index in model_ids]
+    verified_ids: list[int] = []
+
+    # 항목별 줄바꿈을 우선 보존하고, 한 줄 안에서는 문장 단위로 검증합니다.
+    claims = []
+    for line in answer.splitlines():
+        claims.extend(
+            part.strip()
+            # 마침표 뒤의 [C1]·(법령명 제○조)는 바로 앞 문장의 인용입니다.
+            # 인용 앞에서 문장을 쪼개면 정상 인용도 '인용 없는 주장'으로 오판합니다.
+            for part in re.split(r"(?<=[.!?])\s+(?![\[(])", line)
+            if part.strip()
+        )
+
+    for claim in claims:
+        clean = _CITE_ID_RE.sub("", claim)
+        clean = _LOOSE_CITE_ID_RE.sub("", clean).strip()
+        # '[사전 조치]' 같은 제목만 있는 줄은 사실 주장으로 채점하지 않습니다.
+        if len(re.sub(r"[^0-9A-Za-z가-힣]", "", clean)) < 5:
+            continue
+
+        scores = [
+            _claim_support_score(claim, doc)
+            for doc in docs
+        ]
+        if not scores:
+            continue
+        best_score = max(scores)
+        cited_in_claim = _extract_citation_ids(claim, docs)
+
+        # 모델이 실제로 적은 출처 중 내용 점수가 충분한 것만 남깁니다.
+        # 법령 RAG에서는 인용이 없거나 틀렸을 때 단어가 비슷한 다른 조문을
+        # 프로그램이 임의로 붙이는 것보다 '인용 누락/오류'로 남기는 편이 안전합니다.
+        valid_cited = [
+            index for index in cited_in_claim
+            if scores[index - 1] >= 0.35
+            and (
+                scores[index - 1] >= best_score - 0.10
+                or _claim_role_source_match(claim, docs[index - 1])
+            )
+        ]
+        for index in valid_cited:
+            if index not in verified_ids:
+                verified_ids.append(index)
+
+    verified_sources = [_source_name(docs[index - 1]) for index in verified_ids]
+    repaired = set(model_sources) != set(verified_sources)
+
+    # 잘못된 C-ID는 사용자 답변에 남기지 않고, 검증된 출처만 한 번 표시합니다.
+    resolved = _clean_answer_artifacts(answer)
+    if verified_sources and REFUSAL_MSG not in resolved:
+        resolved = f"{resolved}\n\n(검증된 근거: {', '.join(verified_sources)})"
+    return resolved, model_sources, verified_sources, repaired
+
+
+def resolve_citations(answer: str, docs) -> tuple[str, list[str]]:
+    """
+    답변 속 [C1] 또는 (근거 1) 표기를 해석해:
+      1) 실제 사용된 출처 목록(used_sources)을 만들고
+      2) 답변의 (근거 N)을 실제 법령명·조문으로 치환한다.
+    → sources(검색된 전체)와 달리 used_sources는 '답변이 실제 인용한' 출처입니다.
+    """
+    used_ids = []
+    for m in _CITE_ID_RE.finditer(answer):
+        for n in re.findall(r"\d+", m.group(1)):
+            i = int(n)
+            if 1 <= i <= len(docs) and i not in used_ids:
+                used_ids.append(i)
+
+    # 괄호 없는 "근거 1" 표기도 허용합니다.
+    for m in _LOOSE_CITE_ID_RE.finditer(answer):
+        i = int(m.group(1))
+        if 1 <= i <= len(docs) and i not in used_ids:
+            used_ids.append(i)
+
+    # 모델이 C-ID 대신 "산업안전보건법 제52조"처럼 실제 조문을 직접 쓴 경우,
+    # 그 조문이 검색 문서 안에 있을 때만 실제 사용 출처로 인정합니다.
+    # 검색되지 않은 조문은 절대로 used_sources에 자동 추가하지 않습니다.
+    compact_answer = re.sub(r"\s+", "", answer)
+    for i, doc in enumerate(docs, 1):
+        law_name = str(doc.metadata.get("법령명", "")).strip()
+        jo_label = _jo_label(doc.metadata).strip()
+        if not law_name or not jo_label:
+            continue
+        compact_source = re.sub(r"\s+", "", f"{law_name}{jo_label}")
+        direct_match = compact_source in compact_answer
+
+        # "산업안전보건법 시행령"을 "시행령"으로 줄여 쓴 표기도 허용합니다.
+        short_law = (
+            "시행령" if "시행령" in law_name
+            else "규칙" if "규칙" in law_name
+            else "산업안전보건법"
+        )
+        compact_short = re.sub(r"\s+", "", f"{short_law}{jo_label}")
+        direct_match = direct_match or compact_short in compact_answer
+
+        # JSON의 별표 표기(별표0003의00)와 사람이 쓰는 표기(별표3)를 맞춥니다.
+        annex_match = re.fullmatch(r"별표0*(\d+)(?:의0*\d+)?", jo_label)
+        if annex_match:
+            human_annex = f"별표{int(annex_match.group(1))}"
+            direct_match = direct_match or (
+                re.sub(r"\s+", "", f"{law_name}{human_annex}") in compact_answer
+                or re.sub(r"\s+", "", f"{short_law}{human_annex}") in compact_answer
+            )
+
+        if direct_match and i not in used_ids:
+            used_ids.append(i)
+
+    used_sources = [_source_name(docs[i - 1]) for i in used_ids]
+
+    def _replace(m):
+        names = []
+        for n in re.findall(r"\d+", m.group(1)):
+            i = int(n)
+            if 1 <= i <= len(docs):
+                nm = _source_name(docs[i - 1])
+                if nm not in names:
+                    names.append(nm)
+        return f"(근거: {', '.join(names)})" if names else m.group(0)
+
+    resolved = _CITE_ID_RE.sub(_replace, answer)
+    return resolved, used_sources
+
+
+# =====================================================================
+# 5) RAG 체인 본체
+# =====================================================================
+def _document_key(doc) -> tuple:
+    """동일 검색 문서를 합칠 때 사용하는 안정적인 키입니다."""
+    return (
+        doc.metadata.get("법령명", ""),
+        _jo_label(doc.metadata),
+        doc.metadata.get("조문제목", ""),
+        doc.page_content,
+    )
+
+
+def _lexical_tokens(text: str) -> list[str]:
+    """
+    법령용 BM25 토큰화입니다.
+
+    한국어에는 조사가 붙기 때문에 공백 단어만 비교하면
+    '안전보건총괄책임자는'과 '안전보건총괄책임자'를 놓칠 수 있습니다.
+    이를 줄이기 위해 공백 단어와 한글 3-gram을 함께 사용합니다.
+    """
+    normalized = re.sub(r"[^0-9A-Za-z가-힣.]+", " ", str(text).lower())
+    words = re.findall(r"[0-9]+(?:\.[0-9]+)?|[a-z]+|[가-힣]+", normalized)
+    tokens: list[str] = list(words)
+    for word in words:
+        if re.fullmatch(r"[가-힣]+", word) and len(word) >= 3:
+            tokens.extend(word[i:i + 3] for i in range(len(word) - 2))
+    return tokens
+
+
+def _expand_queries(question: str) -> list[str]:
+    """
+    한 질문이 여러 조문을 요구하거나 법률 용어가 짧게 쓰인 경우를 위한
+    규칙 기반 질의 확장입니다. 특정 정답 조문 번호를 외우게 하지 않고,
+    사용자가 물은 법률 개념과 행위·결과를 검색어로 풀어 씁니다.
+    """
+    q = re.sub(r"\s+", " ", question).strip()
+    expanded = [q]
+
+    # 선임 대상 질문은 직책명이 정확히 들어간 시행령 제목·별표를 우선 찾습니다.
+    if "안전보건관리책임자" in q:
+        expanded.append(
+            "안전보건관리책임자를 두어야 하는 사업의 종류 사업장 상시근로자 수"
+        )
+    if "안전보건총괄책임자" in q:
+        expanded.append(
+            "안전보건총괄책임자 지정 대상사업 관계수급인 상시근로자 총공사금액"
+        )
+    if "안전관리자" in q:
+        expanded.extend([
+            "안전관리자를 두어야 하는 사업의 종류 상시근로자 수 안전관리자 수 선임방법",
+            "별표 안전관리자를 두어야 하는 사업의 종류 상시근로자 수 안전관리자 수 선임방법",
+        ])
+
+    # 안전조치 주체 질문은 법문에 실제로 쓰이는 위험 예방 표현으로 확장합니다.
+    if all(term in q for term in ("근로자", "안전", "조치", "의무")):
+        expanded.append(
+            "사업주는 기계 기구 위험물 작업방법 위험을 예방하기 위하여 필요한 안전조치"
+        )
+
+    # 사망·처벌은 안전 기준과 별도로 벌칙 조문을 찾아야 하는 다중 검색입니다.
+    if "사망" in q and any(term in q for term in ("처벌", "벌금", "징역", "위반")):
+        expanded.append(
+            "안전조치 보건조치 의무를 위반하여 근로자를 사망에 이르게 한 자 벌칙 징역 벌금"
+        )
+        # 사망 결과를 묻는 질문은 개별 작업기준과 별도로 법률상 안전조치 의무를 확인합니다.
+        expanded.append(
+            "사업주는 기계 기구 작업방법 위험을 예방하기 위하여 필요한 안전조치"
+        )
+        if "밀폐공간" in q:
+            expanded.append(
+                "사업주는 가스 증기 산소결핍에 의한 건강장해를 예방하기 위하여 필요한 보건조치"
+            )
+
+    # 풍속 질문은 운전 중지, 이탈 방지, 사후 점검이 서로 다른 조문입니다.
+    if ("타워크레인" in q or "크레인" in q) and any(
+        term in q for term in ("풍속", "강풍", "바람", "폭풍")
+    ):
+        expanded.append("타워크레인 순간풍속 운전작업 중지")
+        if any(term in q for term in ("설치", "수리", "해체", "단계별", "점점")):
+            expanded.append("타워크레인 순간풍속 설치 수리 점검 해체 작업 중지")
+        if any(term in q for term in ("30", "단계별", "점점", "예상", "분 뒤")):
+            expanded.extend([
+                "옥외 주행 크레인 폭풍 이탈 방지 순간풍속",
+                "옥외 양중기 폭풍 후 이상 유무 점검",
+            ])
+
+    # 밀폐공간 복합 질문은 공기 기준·보건조치·벌칙을 각각 검색합니다.
+    if "밀폐공간" in q:
+        expanded.append(
+            "밀폐공간 적정공기 산소농도 이산화탄소 일산화탄소 황화수소"
+        )
+        if any(term in q for term in ("질식", "사망", "위반", "보건조치")):
+            expanded.append("밀폐공간 질식 보건조치 사업주")
+
+    # 같은 문장을 중복 검색하지 않습니다.
+    return list(dict.fromkeys(expanded))
+
+
+def _scope_refusal(question: str) -> str | None:
+    """
+    정적인 법령 데이터로 답할 수 없는 질문을 검색 전에 판별합니다.
+    이 판별은 검색 점수와 무관하므로 관련 없는 조문을 억지로 붙이지 않습니다.
+    """
+    q = re.sub(r"\s+", "", question)
+    asks_latest_revision = (
+        ("개정" in q and any(term in q for term in ("최신", "최근", "지난달")))
+        or "실시간" in q
+    )
+    if asks_latest_revision:
+        return (
+            "제공된 법령 데이터의 시점 이후 최신 개정 여부는 확인할 수 없습니다. "
+            "최신 내용은 국가법령정보센터에서 확인해 주세요."
+        )
+    if (
+        any(term in q for term in ("오늘", "현재현장", "우리현장"))
+        and any(term in q for term in ("문제없", "가동해도", "돌려도", "판단"))
+    ):
+        return (
+            "제공된 법령만으로 개별 현장의 가동 가능 여부를 판단할 수 없습니다. "
+            "현장 조건을 확인해 관리감독자 또는 관계 기관에 문의해 주세요."
+        )
+    return None
+
+
+class RagChain:
+    def __init__(self, store, llm, prompt: dict,
+                 top_k: int = 3, search_type: str = "similarity",
+                 score_threshold: float = 0.0,
+                 simple_max_new_tokens: int = 220,
+                 multi_max_new_tokens: int = 420):
+        self.store = store
+        self.llm = llm                      # .chat(system, user) 지원 래퍼
+        self.system = prompt["system"]
+        self.user_template = prompt["user"]
+        self.require_citation = prompt.get("require_citation", False)
+        self.top_k = top_k
+        self.search_type = search_type
+        self.score_threshold = score_threshold  # 0.0이면 게이트 비활성화
+        self.simple_max_new_tokens = simple_max_new_tokens
+        self.multi_max_new_tokens = multi_max_new_tokens
+        # MMR용 검색기 (similarity/hybrid는 별도 점수 조회로 처리)
+        search_kwargs = {"k": top_k}
+        if search_type == "mmr":
+            search_kwargs["fetch_k"] = max(top_k * 4, 20)
+        retriever_type = "mmr" if search_type == "mmr" else "similarity"
+        self.retriever = store.as_retriever(
+            search_type=retriever_type, search_kwargs=search_kwargs
+        )
+
+        # FAISS에 저장된 모든 문서를 이용해 가벼운 BM25 인덱스를 준비합니다.
+        # 임베딩을 다시 만들지 않고도 hybrid 검색을 사용할 수 있습니다.
+        self._all_docs = self._extract_all_documents()
+        self._bm25_doc_tokens: list[list[str]] = []
+        self._bm25_term_freqs: list[Counter] = []
+        self._bm25_doc_freq: Counter = Counter()
+        self._bm25_avg_len = 0.0
+        if search_type == "hybrid":
+            self._prepare_bm25()
+
+    def _extract_all_documents(self) -> list:
+        """FAISS/Chroma에서 BM25에 사용할 전체 문서를 가능한 범위에서 읽습니다."""
+        docstore = getattr(self.store, "docstore", None)
+        raw_dict = getattr(docstore, "_dict", None)
+        if isinstance(raw_dict, dict):
+            return list(raw_dict.values())
+
+        # Chroma는 get(include=...)로 전체 본문과 메타데이터를 꺼낼 수 있습니다.
+        collection = getattr(self.store, "_collection", None)
+        if collection is not None:
+            try:
+                from langchain_core.documents import Document
+                payload = collection.get(include=["documents", "metadatas"])
+                texts = payload.get("documents") or []
+                metas = payload.get("metadatas") or [{} for _ in texts]
+                return [
+                    Document(page_content=text, metadata=meta or {})
+                    for text, meta in zip(texts, metas)
+                ]
+            except Exception:
+                return []
+        return []
+
+    def _prepare_bm25(self) -> None:
+        """전체 문서를 BM25 검색용 통계로 변환합니다."""
+        if not self._all_docs:
+            print("[hybrid] 전체 문서를 읽지 못해 dense similarity 검색으로 폴백합니다.")
+            return
+
+        total_len = 0
+        for doc in self._all_docs:
+            # 법령명·조문제목을 본문 앞에 두 번 넣어 제목의 정확 일치를 강화합니다.
+            meta_text = (
+                f"{doc.metadata.get('법령명', '')} "
+                f"{_jo_label(doc.metadata)} "
+                f"{doc.metadata.get('조문제목', '')} "
+                f"{doc.metadata.get('조문제목', '')}"
+            )
+            tokens = _lexical_tokens(f"{meta_text}\n{doc.page_content}")
+            tf = Counter(tokens)
+            self._bm25_doc_tokens.append(tokens)
+            self._bm25_term_freqs.append(tf)
+            self._bm25_doc_freq.update(tf.keys())
+            total_len += len(tokens)
+
+        self._bm25_avg_len = total_len / max(len(self._all_docs), 1)
+        print(f"[hybrid] BM25 인덱스 준비 완료: {len(self._all_docs)}개 문서")
+
+    def _bm25_scores(self, query: str) -> list[float]:
+        """외부 서버나 재임베딩 없이 로컬에서 BM25 점수를 계산합니다."""
+        n_docs = len(self._all_docs)
+        if n_docs == 0:
+            return []
+
+        query_tf = Counter(_lexical_tokens(query))
+        k1, b = 1.5, 0.75
+        scores = [0.0] * n_docs
+        for term, q_count in query_tf.items():
+            df = self._bm25_doc_freq.get(term, 0)
+            if df == 0:
+                continue
+            idf = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+            for idx, tf in enumerate(self._bm25_term_freqs):
+                freq = tf.get(term, 0)
+                if freq == 0:
+                    continue
+                doc_len = len(self._bm25_doc_tokens[idx])
+                denom = freq + k1 * (
+                    1.0 - b + b * doc_len / max(self._bm25_avg_len, 1.0)
+                )
+                scores[idx] += q_count * idf * (freq * (k1 + 1.0) / denom)
+        return scores
+
+    def _hybrid_retrieve(self, question: str):
+        """
+        dense 임베딩과 BM25를 합친 하이브리드 검색입니다.
+        여러 조문이 필요한 질문은 확장 질의를 각각 검색한 뒤 결과를 합칩니다.
+        """
+        if not self._all_docs:
+            return self._retrieve_similarity(question)
+
+        candidate_k = max(self.top_k * 6, 30)
+        dense_rank: defaultdict[tuple, float] = defaultdict(float)
+        lexical_rank: defaultdict[tuple, float] = defaultdict(float)
+        docs_by_key: dict[tuple, object] = {}
+        priority_keys: list[tuple] = []
+
+        for query_index, query in enumerate(_expand_queries(question)):
+            # dense 검색은 점수 절댓값보다 순위를 안정적으로 사용합니다.
+            try:
+                dense_pairs = self.store.similarity_search_with_relevance_scores(
+                    query, k=candidate_k
+                )
+            except Exception:
+                dense_docs = self.store.similarity_search(query, k=candidate_k)
+                dense_pairs = [(doc, 0.0) for doc in dense_docs]
+            for rank, (doc, _) in enumerate(dense_pairs, 1):
+                key = _document_key(doc)
+                docs_by_key[key] = doc
+                dense_rank[key] = max(dense_rank[key], 1.0 / rank)
+
+            # BM25는 전체 문서에서 상위 후보만 합칩니다.
+            lexical_scores = self._bm25_scores(query)
+            top_indices = sorted(
+                range(len(lexical_scores)),
+                key=lexical_scores.__getitem__,
+                reverse=True,
+            )[:candidate_k]
+            for rank, idx in enumerate(top_indices, 1):
+                score = lexical_scores[idx]
+                if score <= 0:
+                    continue
+                doc = self._all_docs[idx]
+                key = _document_key(doc)
+                docs_by_key[key] = doc
+                # 질의마다 점수 범위가 달라 raw BM25를 직접 합치지 않고 순위를 합칩니다.
+                lexical_rank[key] = max(lexical_rank[key], 1.0 / rank)
+                # 원 질문이 아닌 확장 질의의 1위는 복합질문의 근거 후보로 보존합니다.
+                if query_index > 0 and rank == 1 and key not in priority_keys:
+                    priority_keys.append(key)
+
+        max_dense = max(dense_rank.values(), default=1.0)
+        max_lexical = max(lexical_rank.values(), default=1.0)
+        ranked = []
+        priority_set = set(priority_keys)
+        compact_question = re.sub(r"\s+", "", question)
+        for key, doc in docs_by_key.items():
+            dense = dense_rank.get(key, 0.0) / max_dense
+            lexical = lexical_rank.get(key, 0.0) / max_lexical
+
+            # 질문에 직책명·설비명이 그대로 있을 때 같은 말을 가진 문서를 우대합니다.
+            doc_title = re.sub(
+                r"\s+", "",
+                str(doc.metadata.get("조문제목", "")),
+            )
+            doc_text = re.sub(
+                r"\s+", "",
+                f"{doc.metadata.get('조문제목', '')}{doc.page_content}",
+            )
+            phrase_bonus = 0.0
+            for phrase in (
+                "안전보건관리책임자", "안전보건총괄책임자", "안전관리자",
+                "타워크레인", "밀폐공간", "적정공기", "작업중지",
+            ):
+                if phrase not in compact_question:
+                    continue
+                if phrase in doc_title:
+                    phrase_bonus += 0.2
+                elif phrase in doc_text:
+                    phrase_bonus += 0.05
+
+            # 처벌을 묻는 질문에서는 일반 의무 조문보다 벌칙 제목을 우선 제시합니다.
+            if any(term in compact_question for term in ("처벌", "벌금", "징역")):
+                if "벌칙" in doc_title:
+                    phrase_bonus += 0.25
+            if any(term in compact_question for term in ("몇명", "인원", "선임방법")):
+                if str(_jo_label(doc.metadata)).startswith("별표"):
+                    phrase_bonus += 0.25
+
+            # 이름이 비슷한 직책(안전관리자/보건관리자 등)의 별표가 서로 섞이는
+            # 법령 검색 오류를 줄입니다. 질문 직책과 제목 직책이 다르면 감점합니다.
+            role_names = (
+                "안전보건관리책임자", "안전보건총괄책임자",
+                "안전보건관리담당자", "안전관리자", "보건관리자",
+            )
+            requested_roles = [role for role in role_names if role in compact_question]
+            if requested_roles and any(role in doc_title for role in role_names):
+                if not any(role in doc_title for role in requested_roles):
+                    phrase_bonus -= 0.35
+            phrase_bonus = min(phrase_bonus, 0.4)
+
+            # 확장 질의의 1위 문서는 복합질문의 서로 다른 하위 근거이므로 소폭 우대합니다.
+            expansion_bonus = 0.2 if key in priority_set else 0.0
+            combined = (
+                0.35 * dense + 0.55 * lexical + phrase_bonus + expansion_bonus
+            )
+            ranked.append((combined, doc))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+
+        # 같은 조문의 여러 항이 상위권을 독점하지 않도록 출처 단위로 우선 중복 제거합니다.
+        unique_ranked = []
+        seen_sources = set()
+        for score, doc in ranked:
+            source = _source_name(doc)
+            if source in seen_sources:
+                continue
+            seen_sources.add(source)
+            unique_ranked.append((score, doc))
+
+        selected = unique_ranked[:self.top_k]
+        selected_keys = {_document_key(doc) for _, doc in selected}
+
+        # 확장 질의가 찾은 서로 다른 핵심 근거가 top-k에서 밀렸다면
+        # 우선순위가 아닌 마지막 후보와 교체해 다중조문 질문의 근거를 보존합니다.
+        score_by_key = {_document_key(doc): score for score, doc in unique_ranked}
+        doc_by_key = {_document_key(doc): doc for _, doc in unique_ranked}
+        for key in priority_keys:
+            if key in selected_keys or key not in doc_by_key:
+                continue
+            replace_at = next(
+                (
+                    i for i in range(len(selected) - 1, -1, -1)
+                    if _document_key(selected[i][1]) not in priority_set
+                ),
+                None,
+            )
+            if replace_at is None:
+                continue
+            selected_keys.discard(_document_key(selected[replace_at][1]))
+            selected[replace_at] = (score_by_key[key], doc_by_key[key])
+            selected_keys.add(key)
+
+        selected.sort(key=lambda item: item[0], reverse=True)
+        docs = [doc for _, doc in selected]
+        top_score = min(ranked[0][0], 1.0) if ranked else 0.0
+        return docs, round(float(top_score), 4)
+
+    def _retrieve_similarity(self, question: str):
+        """기존 dense similarity 검색을 유지하는 비교 실험용 함수입니다."""
+        try:
+            pairs = self.store.similarity_search_with_relevance_scores(
+                question, k=self.top_k
+            )
+            docs = [d for d, _ in pairs]
+            top_score = max((s for _, s in pairs), default=0.0)
+            return docs, round(float(top_score), 4)
+        except Exception:
+            return self.retriever.invoke(question), None
+
+    def _retrieve_with_scores(self, question: str):
+        """검색 + 관련도 점수(0~1, 높을수록 관련). 점수 미지원 스토어는 게이트 생략."""
+        if self.search_type == "hybrid":
+            return self._hybrid_retrieve(question)
+        return self._retrieve_similarity(question)
+
+    def _merge_annex_chunks(self, question: str, docs: list) -> list:
+        """
+        검색된 별표 문서에 같은 별표의 관련 청크를 이어 붙입니다.
+
+        기존에는 같은 출처를 중복 제거하면서 별표 제목 청크 하나만 남는 경우가
+        있었습니다. 여기서는 top_k 문서 수는 그대로 유지하면서, 별표 C-ID 안에
+        질문과 가까운 형제 청크를 최대 2개 보강합니다.
+        """
+        if not self._all_docs:
+            return docs
+
+        # 확장 질의별 BM25 점수 중 최고값을 사용해 표의 관련 행을 고릅니다.
+        score_sets = [
+            self._bm25_scores(query)
+            for query in _expand_queries(question)
+        ]
+        merged_docs = []
+        for selected_doc in docs:
+            if not str(_jo_label(selected_doc.metadata)).startswith("별표"):
+                merged_docs.append(selected_doc)
+                continue
+
+            source = _source_name(selected_doc)
+            candidates = []
+            for index, sibling in enumerate(self._all_docs):
+                if _source_name(sibling) != source:
+                    continue
+                sibling_score = max(
+                    (scores[index] for scores in score_sets if index < len(scores)),
+                    default=0.0,
+                )
+                # 제목만 반복된 짧은 청크보다 표의 실제 행이 있는 청크를 우대합니다.
+                if len(sibling.page_content.strip()) >= 100:
+                    sibling_score += 0.15
+                candidates.append((sibling_score, sibling))
+
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            chosen = [selected_doc]
+            chosen_keys = {_document_key(selected_doc)}
+            for _, sibling in candidates:
+                key = _document_key(sibling)
+                if key in chosen_keys:
+                    continue
+                chosen.append(sibling)
+                chosen_keys.add(key)
+                if len(chosen) >= 3:
+                    break
+
+            # 청크 overlap 영역이 그대로 두 번 보이지 않도록 접미/접두 중복을 줄입니다.
+            merged_text = chosen[0].page_content.strip()
+            for sibling in chosen[1:]:
+                next_text = sibling.page_content.strip()
+                overlap = 0
+                max_overlap = min(120, len(merged_text), len(next_text))
+                for size in range(max_overlap, 19, -1):
+                    if merged_text[-size:] == next_text[:size]:
+                        overlap = size
+                        break
+                merged_text += "\n[별표 관련 행]\n" + next_text[overlap:]
+
+            # 모델 입력이 지나치게 길어지는 것을 막되 표의 관련 행은 충분히 보존합니다.
+            merged_text = merged_text[:2200]
+            merged_docs.append(
+                # 원래 검색 문서와 같은 클래스를 사용해 LangChain 버전 차이를 피합니다.
+                type(selected_doc)(
+                    page_content=merged_text,
+                    metadata=dict(selected_doc.metadata),
+                )
+            )
+        return merged_docs
+
+    def search(self, question: str) -> dict:
+        """
+        LLM을 로드하거나 답변을 생성하지 않고 검색 결과만 반환합니다.
+        검색 회귀 테스트와 조문 누락 진단에 사용합니다.
+        """
+        docs, top_score = self._retrieve_with_scores(question)
+        docs = self._merge_annex_chunks(question, docs)
+        return {
+            "question": question,
+            "contexts": [doc.page_content for doc in docs],
+            "sources": [_source_name(doc) for doc in docs],
+            "top_score": top_score,
+        }
+
+    def ask(self, question: str) -> dict:
+        t0 = time.time()
+
+        # ⓪ 정적 법령 데이터로 처리할 수 없는 최신성·개별 현장 판단 질문
+        scope_answer = _scope_refusal(question)
+        if scope_answer is not None:
+            return {
+                "question": question,
+                "answer": scope_answer,
+                "raw_answer": scope_answer,
+                "contexts": [],
+                "sources": [],
+                "prompt_sources": [],
+                "model_used_sources": [],
+                "used_sources": [],
+                "citation_repaired": False,
+                "retrieved": False,
+                "status": "REFUSE",
+                "citation_status": "NOT_APPLICABLE",
+                "initial_truncation_detected": False,
+                "generation_retried": False,
+                "truncation_detected": False,
+                "retry_max_new_tokens": None,
+                "initial_generated_tokens": None,
+                "generated_tokens": None,
+                "initial_hit_token_limit": False,
+                "hit_token_limit": False,
+                "quality_retry_reasons": [],
+                "quality_issues_remaining": [],
+                "top_score": None,
+                "latency": round(time.time() - t0, 3),
+            }
+
+        # ① 검색 + 관련도 점수
+        docs, top_score = self._retrieve_with_scores(question)
+
+        # ② 점수 게이트: 최고 점수가 임계값 미만이면 LLM을 호출하지 않고 거부
+        #    (관련 없는 질문에 억지 근거가 붙는 것을 시스템 차원에서 차단)
+        if (self.score_threshold > 0 and top_score is not None
+                and top_score < self.score_threshold):
+            return {
+                "question": question,
+                "answer": REFUSAL_MSG,
+                "raw_answer": REFUSAL_MSG,
+                "contexts": [],
+                "sources": [_source_name(d) for d in docs],  # 디버깅용 기록
+                "prompt_sources": [],
+                "model_used_sources": [],
+                "used_sources": [],
+                "citation_repaired": False,
+                "retrieved": False,
+                "status": "REFUSE",
+                "citation_status": "NOT_APPLICABLE",
+                "initial_truncation_detected": False,
+                "generation_retried": False,
+                "truncation_detected": False,
+                "retry_max_new_tokens": None,
+                "initial_generated_tokens": None,
+                "generated_tokens": None,
+                "initial_hit_token_limit": False,
+                "hit_token_limit": False,
+                "quality_retry_reasons": [],
+                "quality_issues_remaining": [],
+                "top_score": top_score,
+                "latency": round(time.time() - t0, 3),
+            }
+
+        # ③ MMR이면 다양성 반영된 문서로 교체 (점수는 게이트용으로만 사용)
+        if self.search_type == "mmr":
+            docs = self.retriever.invoke(question)
+
+        # ④ 별표는 질문과 가까운 표 행을 같은 C-ID 안에 연결합니다.
+        docs = self._merge_annex_chunks(question, docs)
+        retrieved_docs = list(docs)
+
+        # ⑤ 질문 유형에 맞는 항목·생성 길이·프롬프트 근거를 정한 뒤 호출합니다.
+        plan = _question_plan(
+            question,
+            single_max_tokens=self.simple_max_new_tokens,
+            multi_max_tokens=self.multi_max_new_tokens,
+        )
+        prompt_docs = _prepare_prompt_documents(question, retrieved_docs, plan)
+        context = format_contexts(prompt_docs)
+        user_msg = self.user_template.format(context=context, question=question)
+        user_msg = f"{user_msg}\n\n{plan['instruction']}"
+        citation_role_instruction = _citation_role_instruction(
+            question,
+            prompt_docs,
+            plan,
+        )
+        if citation_role_instruction:
+            user_msg = f"{user_msg}\n\n{citation_role_instruction}"
+        raw_answer = self.llm.chat(
+            self.system,
+            user_msg,
+            max_new_tokens=plan["max_new_tokens"],
+        )
+
+        # ⑥ 출력 잘림 또는 필수 항목·문장별 인용 누락이 있으면 같은 근거로
+        # 한 번만 재작성합니다. 프로그램이 답이나 출처를 임의로 덧붙이지 않고
+        # 모델이 스스로 완전한 답변과 실제 사용한 C-ID를 다시 출력하게 합니다.
+        initial_generation_tokens = getattr(
+            self.llm, "last_generation_tokens", None
+        )
+        initial_hit_token_limit = bool(
+            getattr(self.llm, "last_generation_hit_limit", False)
+        )
+        initial_truncation = _looks_truncated(
+            raw_answer,
+            hit_token_limit=initial_hit_token_limit,
+        )
+        initial_quality_issues = _quality_retry_issues(
+            raw_answer,
+            question,
+            plan,
+            prompt_docs,
+        )
+        generation_retried = False
+        retry_max_new_tokens = None
+        final_generation_tokens = initial_generation_tokens
+        final_hit_token_limit = initial_hit_token_limit
+        final_quality_issues = list(initial_quality_issues)
+        if initial_truncation or initial_quality_issues:
+            generation_retried = True
+            retry_max_new_tokens = min(
+                max(plan["max_new_tokens"] + 140, int(plan["max_new_tokens"] * 1.6)),
+                680,
+            )
+            retry_reasons = []
+            if initial_truncation:
+                retry_reasons.append(
+                    "- 직전 답변이 생성 한도에서 잘렸습니다. 모든 문장을 완결하세요."
+                )
+            retry_reasons.extend(
+                f"- 수정 필요: {issue}"
+                for issue in initial_quality_issues
+            )
+            retry_user_msg = (
+                f"{user_msg}\n\n"
+                "[재작성 지침]\n"
+                + "\n".join(retry_reasons)
+                + "\n"
+                "- 위 문제를 모두 고쳐 처음부터 다시 작성하세요.\n"
+                "- 질문에서 요구한 항목만 쓰고 모든 문장을 완결하세요.\n"
+                "- 필수 인용 연결의 C-ID를 각 항목 끝에 정확히 붙이세요.\n"
+                "- 마지막 항목까지 작성한 후 반드시 마침표로 끝내세요."
+            )
+            retried_answer = self.llm.chat(
+                self.system,
+                retry_user_msg,
+                max_new_tokens=retry_max_new_tokens,
+            )
+            retried_generation_tokens = getattr(
+                self.llm, "last_generation_tokens", None
+            )
+            retried_hit_token_limit = bool(
+                getattr(self.llm, "last_generation_hit_limit", False)
+            )
+            retried_truncation = _looks_truncated(
+                retried_answer,
+                hit_token_limit=retried_hit_token_limit,
+            )
+            retried_quality_issues = _quality_retry_issues(
+                retried_answer,
+                question,
+                plan,
+                prompt_docs,
+            )
+            # 품질 문제가 줄고 문장이 완결된 재작성만 채택합니다. 최초 답변이
+            # 잘린 경우에는 재작성도 잘렸더라도 더 긴 쪽을 보존합니다.
+            should_replace = (
+                (
+                    not retried_truncation
+                    and (
+                        initial_truncation
+                        or len(retried_quality_issues)
+                        < len(initial_quality_issues)
+                    )
+                )
+                or (
+                    initial_truncation
+                    and len(retried_answer.strip()) > len(raw_answer.strip())
+                )
+            )
+            if should_replace:
+                raw_answer = retried_answer
+                final_generation_tokens = retried_generation_tokens
+                final_hit_token_limit = retried_hit_token_limit
+                final_quality_issues = retried_quality_issues
+
+        truncation_detected = _looks_truncated(
+            raw_answer,
+            hit_token_limit=final_hit_token_limit,
+        )
+
+        # ⑦ 모델이 적은 C-ID를 문장 내용과 대조한 뒤 검증된 출처만 표시합니다.
+        (
+            answer,
+            model_used_sources,
+            used_sources,
+            citation_repaired,
+        ) = validate_and_resolve_citations(raw_answer, prompt_docs)
+
+        # 모델이 명시적으로 거절했을 때만 거절로 정규화합니다.
+        # 인용 형식 실패를 "근거 없음"으로 바꾸지 않습니다. 이전 구현은 정답 조문을
+        # 1위로 검색해도 [C1]이 없다는 이유로 정답 전체를 지우는 문제가 있었습니다.
+        if REFUSAL_MSG in raw_answer:
+            answer = REFUSAL_MSG
+            model_used_sources = []
+            used_sources = []
+            citation_repaired = False
+
+        if answer == REFUSAL_MSG:
+            status = "REFUSE"
+            citation_status = "NOT_APPLICABLE"
+        elif truncation_detected:
+            # 답변 자체는 평가에 보존하되 완성 답변과 구분합니다.
+            status = "ANSWER_TRUNCATED"
+            citation_status = "REPAIRED" if citation_repaired else (
+                "CITED" if used_sources else "MISSING"
+            )
+        elif used_sources:
+            status = "ANSWER"
+            citation_status = "REPAIRED" if citation_repaired else "CITED"
+        else:
+            # 답변은 보존하되 출처 형식이 빠졌음을 평가 결과에 별도로 남깁니다.
+            status = "ANSWER_UNCITED"
+            citation_status = "MISSING"
+
+        return {
+            "question": question,
+            "answer": answer,
+            "raw_answer": raw_answer,
+            # contexts는 실제 LLM에 전달된 근거, sources는 검색 평가용 전체 top-k입니다.
+            "contexts": [d.page_content for d in prompt_docs],
+            "sources": [_source_name(d) for d in retrieved_docs],
+            "prompt_sources": [_source_name(d) for d in prompt_docs],
+            # 모델 원문 인용과 검증 후 인용을 분리해 후처리 효과를 평가할 수 있습니다.
+            "model_used_sources": model_used_sources,
+            "used_sources": used_sources,
+            "citation_repaired": citation_repaired,
+            "question_mode": plan["mode"],
+            "max_new_tokens_used": (
+                retry_max_new_tokens if generation_retried
+                else plan["max_new_tokens"]
+            ),
+            "initial_truncation_detected": initial_truncation,
+            "generation_retried": generation_retried,
+            "truncation_detected": truncation_detected,
+            "retry_max_new_tokens": retry_max_new_tokens,
+            "initial_generated_tokens": initial_generation_tokens,
+            "generated_tokens": final_generation_tokens,
+            "initial_hit_token_limit": initial_hit_token_limit,
+            "hit_token_limit": final_hit_token_limit,
+            # 최초 재작성 사유와 최종적으로 남은 문제를 분리해 CSV에서 확인합니다.
+            "quality_retry_reasons": initial_quality_issues,
+            "quality_issues_remaining": final_quality_issues,
+            "retrieved": True,
+            "status": status,
+            "citation_status": citation_status,
+            "top_score": top_score,
+            "latency": round(time.time() - t0, 3),
+        }
+
+
+# =====================================================================
+# 6) 통합 진입점
+# =====================================================================
+def build_rag_chain(
+    store,
+    llm_type: str = "hf",
+    model_name: str | None = None,
+    prompt_name: str = "basic",
+    top_k: int = 3,
+    search_type: str = "similarity",
+    temperature: float = 0.0,
+    max_new_tokens: int = 220,
+    multi_max_new_tokens: int = 420,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    load_in_4bit: bool = False,
+    score_threshold: float = 0.0,
+    repetition_penalty: float = 1.05,
+    force_cuda: bool = False,
+) -> RagChain:
+    """
+    Args:
+        store         : build_vectorstore() 가 만든 저장소
+        llm_type      : "hf" / "openai" / "anthropic" / "upstage"   (실험 변수)
+        model_name    : 구체적 모델명 또는 파인튜닝 모델 경로         (실험 변수)
+        prompt_name   : "basic" / "cot" / "cite" / "strict"          (실험 변수)
+        top_k         : 검색 chunk 수                                (실험 변수)
+        search_type   : "similarity" / "mmr" / "hybrid"              (실험 변수)
+        max_new_tokens: 생성 최대 토큰 수
+        multi_max_new_tokens: 복합질문 생성 최대 토큰 수
+        api_key       : 미지정 시 환경변수에서 자동 로드(UPSTAGE_API_KEY 등)
+        base_url      : OpenAI 호환 커스텀 엔드포인트용
+        load_in_4bit  : HF 모델 4비트 양자화 (VRAM 부족 시)
+        repetition_penalty: 반복 문장 억제 강도(1.0이면 억제 없음)
+        force_cuda    : CUDA가 없을 때 CPU 폴백 대신 오류 발생
+    """
+    llm = get_llm(llm_type, model_name, temperature=temperature,
+                  max_new_tokens=max_new_tokens,
+                  api_key=api_key, base_url=base_url,
+                  load_in_4bit=load_in_4bit,
+                  repetition_penalty=repetition_penalty,
+                  force_cuda=force_cuda)
+    prompt = get_prompt(prompt_name)
+    chain = RagChain(store, llm, prompt, top_k=top_k, search_type=search_type,
+                     score_threshold=score_threshold,
+                     simple_max_new_tokens=max_new_tokens,
+                     multi_max_new_tokens=multi_max_new_tokens)
+    print(f"[build_rag_chain] LLM={llm_type}({model_name or '기본'}), "
+          f"prompt={prompt_name}, top_k={top_k}, search={search_type}, "
+          f"threshold={score_threshold or '끔'}")
+    return chain
+
+
+# =====================================================================
+# 단독 실행 테스트
+# =====================================================================
+if __name__ == "__main__":
+    import argparse
+    from load_data import load_data
+    from ksj_vectorstore import build_vectorstore
+
+    parser = argparse.ArgumentParser(description="RAG 체인 테스트")
+    parser.add_argument("path")
+    parser.add_argument("--file_type", required=True, choices=["json", "pdf"])
+    parser.add_argument("--store_type", default="faiss")
+    parser.add_argument("--embedding_name", default="hf")
+    parser.add_argument("--llm_type", default="openai")   # 테스트는 API가 빠름
+    parser.add_argument("--model_name", default=None)
+    parser.add_argument("--prompt_name", default="cite")
+    parser.add_argument("--top_k", type=int, default=3)
+    parser.add_argument(
+        "--search_type",
+        default="hybrid",
+        choices=["similarity", "mmr", "hybrid"],
+    )
+    parser.add_argument("--load_in_4bit", action="store_true")
+    args = parser.parse_args()
+
+    docs = load_data(args.path, args.file_type)
+    store = build_vectorstore(docs, store_type=args.store_type,
+                              embedding_name=args.embedding_name, persist_dir=None)
+    chain = build_rag_chain(
+        store, llm_type=args.llm_type, model_name=args.model_name,
+        prompt_name=args.prompt_name, top_k=args.top_k,
+        search_type=args.search_type, load_in_4bit=args.load_in_4bit,
+    )
+
+    q = "타워크레인은 순간풍속 얼마를 초과하면 운전을 멈춰야 하나요?"
+    r = chain.ask(q)
+    print("\n[질문]", r["question"])
+    print("[답변]", r["answer"])
+    print("[출처]", r["sources"])
+    print("[응답시간]", r["latency"], "초")

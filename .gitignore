@@ -243,7 +243,7 @@ runs/
 logs/
 
 # --- 실행 결과 (루트의 results/ 만 무시. eval/results/ 는 계속 커밋함) ---
-/results/
+# /results/
 
 # --- 에디터 개인 설정 ---
 .vscode/
@@ -253,5 +253,5 @@ logs/
 .cache/
 huggingface/
 
-# --- finetune (인환) ---
-finetune/
+# --- finetune ---
+/finetune/
